@@ -1,215 +1,75 @@
 #!/usr/bin/env python3
-"""Paint one or two genomic probes on TruPath flowcell coordinates.
-
-Requires Python >=3.10, samtools and matplotlib. Regions are 1-based inclusive;
-internal intervals are 0-based half-open. No clustering uses genomic distance.
-DRAGEN 4.6 HP/pp and optional HZ/pz are retained separately, as are PS and ps.
-BX groups are inferred templates; spatial groups are exploratory candidates.
 """
-from __future__ import annotations
+plot_virtual_fish.py - "virtual FISH": paint chromosomes or genomic regions onto a TruPath flow-cell lane.
 
+Every Illumina read name records the nanowell the read was sequenced in
+(INSTRUMENT:RUN:FLOWCELL:LANE:TILE:X:Y). This script colours each read pair by the chromosome or
+region it maps to and draws it where it sat on the flow cell, like a chromosome-paint FISH image of
+the lane. On TruPath data the reads of one long DNA molecule land in neighbouring nanowells, so a
+paint shows up as single-coloured spots: the molecules' constellations.
+
+One figure, three zoom levels:
+  lane     every tile of one lane, placed by tile number (surface, swath, tile); colour is the paint
+           mix and intensity the read density, from a uniform sample when there are many reads
+  tile     one tile at full density
+  window   a few thousand read-name units of that tile, one dot per read pair; reads with the same
+           paint that are close on the flow cell and in the genome are joined into constellations
+
+With two or more paints, constellations of different paints that sit together (one DNA molecule
+carrying both, e.g. a BCR-ABL1 fusion) are counted lane-wide, like a dual-fusion FISH probe, next to
+the count expected by chance from a tile-shifted control.
+
+Paints (--paint, repeatable, up to 8): a chromosome (chr7), a region (chr9:130,700,000-130,900,000) or
+a labelled region (ABL1=chr9:130,713,000-130,887,000). Without --paint every primary chromosome
+(1-22, X, Y) gets its own colour; that reads the whole file.
+
+Examples:
+  plot_virtual_fish.py --input sample.cram --reference genome.fa --paint chr7
+  plot_virtual_fish.py --input sample.cram --reference genome.fa \\
+      --paint ABL1=chr9:130,713,000-130,887,000 --paint BCR=chr22:23,180,000-23,320,000
+  plot_virtual_fish.py --input sample.bam --lane 2 --tile 1205        # all chromosomes
+
+Read pairs are counted once (read 1, or unpaired reads); secondary, supplementary, QC-fail and
+duplicate records are skipped. Requires samtools on PATH and Python 3 with numpy and matplotlib.
+"""
 import argparse
+import array
 import collections
-import csv
 import dataclasses
-import gzip
-import json
 import math
-from pathlib import Path
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
-from urllib.parse import unquote
+import zlib
+from pathlib import Path
 
-VERSION = "0.1.0"
-TAGS = ("BX", "HP", "PS", "pp", "HZ", "pz", "PC", "li", "xq", "ps", "tr",
-        "sd", "hl", "gs", "hs", "js", "lv")
-COLORS = {0: "#9ca3af", 1: "#dc3545", 2: "#159b66", 3: "#9b59b6"}
+import numpy as np
+
+# Paint colours in fixed order (validated categorical palette; the first three are the most
+# distinct, so put the paints that matter most first).
+PAINT_COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
+PRIMARY = re.compile(r"(chr)?(\d+|X|Y)", re.IGNORECASE)
+FLUSH = 1 << 20
 
 
 class InputError(Exception):
     pass
 
 
-@dataclasses.dataclass(frozen=True)
-class Probe:
+@dataclasses.dataclass
+class Paint:
     label: str
     chrom: str
-    start: int
+    start: int                # 0-based half-open
     end: int
-    origin: str = "region"
+    whole: bool
 
     @property
     def region(self):
-        return f"{self.chrom}:{self.start + 1}-{self.end}"
-
-
-@dataclasses.dataclass(frozen=True, order=True)
-class Location:
-    instrument: str
-    run: str
-    flowcell: str
-    lane: int
-    tile: str
-    x: int
-    y: int
-
-    @property
-    def tile_key(self):
-        return (self.instrument, self.run, self.flowcell, self.lane, self.tile)
-
-
-@dataclasses.dataclass
-class Alignment:
-    chrom: str
-    start: int
-    end: int
-    cigar: str
-    flag: int
-    mapq: int
-    blocks: list[tuple[int, int]]
-    tags: dict[str, str]
-    tag_types: dict[str, str]
-    targets: int = 0
-
-
-@dataclasses.dataclass
-class Point:
-    qname: str
-    rg: str
-    location: Location
-    alignments: list[Alignment] = dataclasses.field(default_factory=list)
-    targets: int = 0
-    primary_targets: int = 0
-    supplementary_targets: int = 0
-    bx: str | None = None
-    bx_conflict: bool = False
-    group: str | None = None
-
-
-def parse_region(value):
-    label, sep, region = value.partition("=")
-    if not sep:
-        region, label = value, value
-    try:
-        chrom, coords = region.rsplit(":", 1)
-        lo, hi = coords.replace(",", "").split("-", 1)
-        start, end = int(lo), int(hi)
-    except (ValueError, TypeError):
-        raise InputError(f"Invalid region {value!r}; use [LABEL=]chr:start-end.") from None
-    if not label or not chrom or start < 1 or end < start:
-        raise InputError(f"Invalid region {value!r}; coordinates must satisfy 1 <= start <= end.")
-    return Probe(label, chrom, start - 1, end)
-
-
-def parse_location(qname):
-    fields = qname.split(":")
-    if len(fields) < 7 or not all(fields[:5]):
-        raise ValueError("QNAME lacks instrument:run:flowcell:lane:tile:x:y")
-    # Validate every value before adding the record to any collection.
-    lane, x, y = int(fields[3]), int(fields[5]), int(fields[6])
-    if lane < 1:
-        raise ValueError("Invalid lane")
-    return Location(*fields[:3], lane, fields[4], x, y)
-
-
-def cigar_blocks(start, cigar):
-    """Return actual aligned-base blocks and reference-consuming end.
-
-    D and N advance reference coordinates but do not create probe support.
-    An insertion or soft clip alone also does not support a genomic probe.
-    """
-    ops = re.findall(r"(\d+)([MIDNSHP=X])", cigar)
-    if not ops or "".join(n + op for n, op in ops) != cigar:
-        raise ValueError("Invalid CIGAR")
-    pos, blocks = start, []
-    for length, op in ops:
-        n = int(length)
-        if n < 1:
-            raise ValueError("Zero-length CIGAR operation")
-        if op in "M=X":
-            if blocks and blocks[-1][1] == pos:
-                blocks[-1] = (blocks[-1][0], pos + n)
-            else:
-                blocks.append((pos, pos + n))
-            pos += n
-        elif op in "DN":
-            pos += n
-    return blocks, pos
-
-
-def parse_sam_record(line):
-    f = line.rstrip("\n").split("\t")
-    if len(f) < 11:
-        raise ValueError("SAM record has fewer than 11 fields")
-    flag, start, mapq = int(f[1]), int(f[3]) - 1, int(f[4])
-    if flag & 4 or f[2] == "*" or start < 0:
-        raise ValueError("Unmapped or positionless record")
-    tags, types = {}, {}
-    for token in f[11:]:
-        parts = token.split(":", 2)
-        if len(parts) == 3:
-            key, typ, value = parts
-            if key in TAGS or key == "RG":
-                tags[key], types[key] = value, typ
-    blocks, end = cigar_blocks(start, f[5])
-    return f[0], tags.get("RG", ""), parse_location(f[0]), Alignment(
-        f[2], start, end, f[5], flag, mapq, blocks, tags, types)
-
-
-def annotation_attributes(value):
-    if '"' in value:
-        return dict(re.findall(r'(\S+)\s+"([^"]*)"', value))
-    return {k: unquote(v) for item in value.strip().split(";")
-            if "=" in item for k, v in [item.split("=", 1)]}
-
-
-def resolve_genes(path, queries):
-    """Resolve exact gene symbols/IDs; SYMBOL@contig disambiguates alternatives."""
-    requests = [q.rsplit("@", 1) if "@" in q else (q, None) for q in queries]
-    candidates = [dict() for _ in queries]
-    opener = gzip.open if str(path).endswith(".gz") else open
-    with opener(path, "rt") as handle:
-        for number, line in enumerate(handle, 1):
-            if line.startswith("##FASTA"):
-                break
-            if not line.strip() or line.startswith("#"):
-                continue
-            f = line.rstrip("\n").split("\t")
-            if len(f) != 9:
-                raise InputError(f"Annotation line {number} has {len(f)} fields, expected 9.")
-            attr = annotation_attributes(f[8])
-            is_gene = f[2].lower() in {"gene", "pseudogene"}
-            # GTF fallback can aggregate transcripts/exons by gene_id. GFF3 needs gene features.
-            symbol = attr.get("gene_name") or attr.get("gene") or (attr.get("Name") if is_gene else None)
-            gid = attr.get("gene_id") or (attr.get("ID") if is_gene else None)
-            names = {n for n in (symbol, gid) if n}
-            for i, (query, contig) in enumerate(requests):
-                if query not in names or (contig and f[0] != contig):
-                    continue
-                try:
-                    lo, hi = int(f[3]) - 1, int(f[4])
-                except ValueError:
-                    raise InputError(f"Invalid annotation coordinates at line {number}.") from None
-                if lo < 0 or hi <= lo:
-                    raise InputError(f"Invalid annotation coordinates at line {number}.")
-                key = (gid or symbol, f[0])
-                bucket = candidates[i].setdefault(key, {"gene": [], "fallback": []})
-                bucket["gene" if is_gene else "fallback"].append((lo, hi))
-    result = []
-    for query, matches in zip(queries, candidates):
-        if not matches:
-            raise InputError(f"Gene {query!r} was not found in {path}; use an exact gene_name/gene_id/Name/ID.")
-        if len(matches) != 1:
-            choices = ", ".join(f"{gid}@{chrom}" for gid, chrom in sorted(matches))
-            raise InputError(f"Gene {query!r} is ambiguous: {choices}. Use a gene ID or SYMBOL@contig.")
-        (_, chrom), bounds = next(iter(matches.items()))
-        intervals = bounds["gene"] or bounds["fallback"]
-        result.append(Probe(query, chrom, min(a for a, _ in intervals),
-                            max(b for _, b in intervals), "gene"))
-    return result
+        name = f"{{{self.chrom}}}" if ":" in self.chrom else self.chrom
+        return name if self.whole else f"{name}:{self.start + 1}-{self.end}"
 
 
 def run_capture(cmd):
@@ -219,511 +79,577 @@ def run_capture(cmd):
     return result.stdout
 
 
-def parse_header(header):
-    contigs, read_groups, programs = {}, [], []
-    for line in header.splitlines():
-        f = line.split("\t")
-        attributes = dict(x.split(":", 1) for x in f[1:] if ":" in x)
-        if f[0] == "@SQ":
-            contigs[attributes["SN"]] = int(attributes["LN"])
-        elif f[0] == "@RG":
-            read_groups.append(attributes)
-        elif f[0] == "@PG":
-            programs.append(attributes)
-    versions = sorted({p.get("VN", "unknown") for p in programs
-                       if "dragen" in (p.get("PN", "") + p.get("ID", "")).lower()})
-    return contigs, {"read_groups": read_groups, "programs": programs, "dragen_versions": versions}
+def read_contigs(args):
+    cmd = [args.samtools, "view", "-H"] + (["-T", args.reference] if args.reference else []) + [args.input]
+    contigs = {}
+    for line in run_capture(cmd).splitlines():
+        if line.startswith("@SQ"):
+            tags = dict(t.split(":", 1) for t in line.split("\t")[1:] if ":" in t)
+            contigs[tags["SN"]] = int(tags["LN"])
+    if not contigs:
+        raise InputError("No @SQ lines in the alignment header; is the file aligned?")
+    return contigs
 
 
-def match_contig(chrom, contigs):
-    if chrom in contigs:
-        return chrom
-    aliases = {chrom[3:] if chrom.startswith("chr") else "chr" + chrom}
-    if chrom in {"M", "MT", "chrM", "chrMT"}:
-        aliases |= {"M", "MT", "chrM", "chrMT"}
-    available = aliases.intersection(contigs)
-    if len(available) == 1:
-        return available.pop()
-    raise InputError(f"Contig {chrom!r} absent or ambiguous in alignment header. Use an exact contig name.")
+def match_contig(name, contigs):
+    if name in contigs:
+        return name
+    alias = name[3:] if name.startswith("chr") else "chr" + name
+    if alias in contigs:
+        return alias
+    raise InputError(f"Contig {name!r} not found in the alignment header.")
 
 
-def prepare_probes(probes, contigs):
-    result = []
-    for p in probes:
-        chrom = match_contig(p.chrom, contigs)
-        if p.end > contigs[chrom]:
-            raise InputError(f"Probe {p.region} exceeds contig length {contigs[chrom]}.")
-        result.append(dataclasses.replace(p, chrom=chrom))
-    return result
+def parse_paint(value, contigs):
+    label, sep, spec = value.partition("=")
+    if not sep:
+        label, spec = "", value
+    m = re.fullmatch(r"(.+):([\d,]+)-([\d,]+)", spec.strip())
+    chrom = match_contig(m.group(1) if m else spec.strip(), contigs)
+    if not m:
+        return Paint(label or chrom, chrom, 0, contigs[chrom], True)
+    start, end = int(m.group(2).replace(",", "")), int(m.group(3).replace(",", ""))
+    if not 1 <= start <= end <= contigs[chrom]:
+        raise InputError(f"Invalid paint {value!r}: need 1 <= start <= end <= {contigs[chrom]:,}.")
+    return Paint(label or f"{chrom}:{start:,}-{end:,}", chrom, start - 1, end, False)
 
 
-def query_windows(probes, padding, contigs):
-    by_chrom = collections.defaultdict(list)
-    for p in probes:
-        by_chrom[p.chrom].append((max(0, p.start - padding), min(contigs[p.chrom], p.end + padding)))
-    windows = []
-    for chrom in sorted(by_chrom):
-        merged = []
-        for start, end in sorted(by_chrom[chrom]):
-            if merged and start <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-            else:
-                merged.append((start, end))
-        windows.extend((chrom, start, end) for start, end in merged)
-    return windows
+def check_overlaps(paints):
+    for a in paints:
+        for b in paints:
+            if a is not b and a.chrom == b.chrom and a.start < b.end and b.start < a.end:
+                raise InputError(f"Paints {a.label} and {b.label} overlap; a read can carry only one paint.")
 
 
-def target_mask(alignment, probes):
-    return sum(1 << i for i, p in enumerate(probes)
-               if alignment.chrom == p.chrom and
-               any(a < p.end and b > p.start for a, b in alignment.blocks))
+def tone(hex_color, toward, amount):
+    rgb = np.array([int(hex_color[i:i + 2], 16) / 255 for i in (1, 3, 5)])
+    return tuple(rgb + (toward - rgb) * amount)
 
 
-def collect_points(lines, probes, args):
-    points, stats = {}, collections.Counter()
-    for line in lines:
-        if line.startswith("@") or not line.strip():
-            continue
-        stats["records_fetched"] += 1
+def paint_colors(n):
+    """RGB per paint. Up to 8: the palette. 24 chromosomes: the 8 hues in base, dark and light tones;
+    the window panel's constellation labels name them, so identity never rests on colour alone."""
+    if n <= len(PAINT_COLORS):
+        return np.array([tone(c, 0, 0) for c in PAINT_COLORS[:n]])
+    tones = [(0, 0), (0, 0.38), (1, 0.32)]
+    return np.array([tone(PAINT_COLORS[i % 8], *tones[i // 8 % 3]) for i in range(n)])
+
+
+class Sample:
+    """Reads kept for plotting: every read on the protected (zoom) tile, plus a uniform sample of at
+    most `budget` other reads. Reads are kept when a hash of their name falls below a threshold that
+    halves each time the budget is exceeded, so the sample stays uniform while it is thinned."""
+
+    def __init__(self, budget):
+        self.budget, self.threshold, self.protected = budget, 1 << 32, None
+        self.buffer = [array.array(code) for code in "iiihiI"]     # tile, x, y, paint, pos, hash
+        self.chunks, self.sampled = [], 0
+
+    def add(self, tile, x, y, paint, pos, digest):
+        protected = tile == self.protected
+        if digest >= self.threshold and not protected:
+            return
+        b = self.buffer
+        b[0].append(tile)
+        b[1].append(x)
+        b[2].append(y)
+        b[3].append(paint)
+        b[4].append(pos)
+        b[5].append(digest)
+        if not protected:
+            self.sampled += 1
+            if self.sampled > self.budget:
+                self.thin()
+        if len(self.buffer[0]) >= FLUSH:
+            self.flush()
+
+    def flush(self):
+        if len(self.buffer[0]):
+            self.chunks.append([np.frombuffer(c, dtype=c.typecode).copy() for c in self.buffer])
+            self.buffer = [array.array(c.typecode) for c in self.buffer]
+
+    def thin(self):
+        self.flush()
+        self.threshold >>= 1
+        kept, self.sampled = [], 0
+        for chunk in self.chunks:
+            outside = chunk[0] != self.protected
+            keep = (chunk[5] < self.threshold) | ~outside
+            kept.append([c[keep] for c in chunk])
+            self.sampled += int((keep & outside).sum())
+        self.chunks = kept
+
+    def arrays(self):
+        self.flush()
+        if not self.chunks:
+            return [np.zeros(0, dtype=c.typecode) for c in self.buffer]
+        return [np.concatenate(parts) for parts in zip(*self.chunks)]
+
+
+def collect(args, paints):
+    """Stream read 1 records from samtools and keep those of the chosen lane that carry a paint.
+
+    Lines are handled as bytes and samtools drops the aux tags; for CRAM, htslib decodes only the
+    fields used here (QNAME, FLAG, RNAME, POS, MAPQ, CIGAR), skipping sequence and qualities.
+    """
+    flags = 4 | 128 | 256 | 512 | 2048 | (0 if args.keep_duplicates else 1024)
+    cmd = [args.samtools, "view", "-M", "-F", str(flags), "-q", str(args.mapq), "-@", str(args.threads),
+           "--keep-tag", "RG"]
+    if args.reference:
+        cmd += ["-T", args.reference]
+    if Path(args.input).suffix.lower() == ".cram":
+        cmd += ["--input-fmt-option", "required_fields=0x3f"]
+    if args.subsample:
+        cmd += ["--subsample", str(args.subsample), "--subsample-seed", "1"]
+    cmd += [args.input] + [p.region for p in paints]
+    targets = collections.defaultdict(list)
+    for i, p in enumerate(paints):
+        targets[p.chrom.encode()].append((p.start, p.end, i))
+    want_fc, _, want_lane = (v.encode() for v in args.lane.rpartition(":")) if args.lane else (b"", b"", None)
+    want_tile = args.tile.encode() if args.tile else None
+    lane, lanes, tiles = None, collections.Counter(), {}
+    totals, bad = [0] * len(paints), 0
+    sample = Sample(args.max_points)
+    with tempfile.TemporaryFile(mode="w+t") as errors:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, bufsize=1 << 20)
         try:
-            qname, rg, loc, alignment = parse_sam_record(line)
-        except (ValueError, IndexError):
-            stats["malformed_or_coordinate_free_records"] += 1
+            for line in proc.stdout:
+                qname, _, rname, pos, _ = line.split(b"\t", 4)
+                f = qname.split(b":")
+                if len(f) < 7:
+                    bad += 1
+                    continue
+                lanes[f[2], f[3]] += 1
+                if lane is None:
+                    if (want_lane and f[3] != want_lane) or (want_fc and f[2] != want_fc):
+                        continue
+                    lane = (f[2], f[3])
+                if f[2] != lane[0] or f[3] != lane[1]:
+                    continue
+                p = int(pos) - 1
+                for start, end, paint in targets.get(rname, ()):
+                    if start <= p < end:
+                        break
+                else:
+                    continue
+                try:
+                    x, y = int(f[5]), int(f[6])
+                except ValueError:
+                    bad += 1
+                    continue
+                tile = tiles.get(f[4])
+                if tile is None:
+                    tile = tiles[f[4]] = len(tiles)
+                    if sample.protected is None and f[4] == (want_tile or f[4]):
+                        sample.protected = tile
+                totals[paint] += 1
+                sample.add(tile, x, y, paint, p, zlib.crc32(qname))
+            proc.stdout.close()
+            code = proc.wait()
+        except BaseException:
+            proc.terminate()
+            proc.wait()
+            raise
+        errors.seek(0)
+        diagnostic = errors.read().strip()
+    if code:
+        raise InputError(f"samtools view failed: {diagnostic}")
+    if lane is None:
+        if bad and not lanes:
+            raise InputError("Read names lack INSTRUMENT:RUN:FLOWCELL:LANE:TILE:X:Y; were the original "
+                             "Illumina names kept?")
+        seen = ", ".join(f"{fc.decode()}:{ln.decode()}" for fc, ln in sorted(lanes)) or "none"
+        raise InputError(f"No painted reads in lane {args.lane or '(any)'}; lanes seen: {seen}.")
+    lane = (lane[0].decode(), lane[1].decode())
+    if want_tile and want_tile not in tiles:
+        raise InputError(f"Tile {args.tile} has no painted reads in lane {lane[0]}:{lane[1]}.")
+    names = [n.decode() for n in sorted(tiles, key=tiles.get)]
+    lanes = collections.Counter({(fc.decode(), ln.decode()): n for (fc, ln), n in lanes.items()})
+    return dict(lane=lane, lanes=lanes, tiles=names, totals=totals, bad=bad, sample=sample,
+                columns=sample.arrays())
+
+
+def tile_layout(names):
+    """(surface, swath, number) per tile from SSTT names such as 1205; else name order, 20 per row."""
+    if all(len(n) == 4 and n.isdigit() for n in names):
+        return [(int(n[0]), int(n[1]), int(n[2:])) for n in names], True
+    rank = {n: i for i, n in enumerate(sorted(names, key=lambda n: (len(n), n)))}
+    return [(1, rank[n] // 20 + 1, rank[n] % 20 + 1) for n in names], False
+
+
+def densest(x, y, size, bounds):
+    """Centre of the size x size square (on a size/3 grid) holding the most reads."""
+    (x0, x1), (y0, y1) = bounds
+    step = size / 3
+    hx = np.floor((x - x0) / step).astype(int)
+    hy = np.floor((y - y0) / step).astype(int)
+    grid = np.zeros((hx.max() + 3, hy.max() + 3))
+    np.add.at(grid, (hx, hy), 1)
+    window = sum(np.roll(np.roll(grid, -i, 0), -j, 1) for i in range(3) for j in range(3))
+    i, j = np.unravel_index(window.argmax(), window.shape)
+    cx = min(max(x0 + (i + 1.5) * step, x0 + size / 2), x1 - size / 2)
+    cy = min(max(y0 + (j + 1.5) * step, y0 + size / 2), y1 - size / 2)
+    return cx, cy
+
+
+def constellations(x, y, paint, pos, radius, max_gap):
+    """Single-linkage groups of reads with the same paint, within `radius` on the flow cell and
+    `max_gap` bp in the genome. Returns a group label per read."""
+    n = len(x)
+    labels = np.arange(n)
+    if n < 2:
+        return labels
+    cx, cy = np.floor(x / radius).astype(np.int64), np.floor(y / radius).astype(np.int64)
+    key = (cx - cx.min()) * (cy.max() - cy.min() + 3) + (cy - cy.min())
+    stride = int(cy.max() - cy.min() + 3)
+    order = np.argsort(key, kind="stable")
+    cells, starts = np.unique(key[order], return_index=True)
+    bounds = dict(zip(cells.tolist(), zip(starts.tolist(), np.append(starts[1:], n).tolist())))
+    left, right = [], []
+    for cell, (s, e) in bounds.items():
+        a = order[s:e]
+        for offset in (0, 1, stride - 1, stride, stride + 1):        # each neighbouring cell pair once
+            if cell + offset not in bounds:
+                continue
+            s2, e2 = bounds[cell + offset]
+            b = order[s2:e2]
+            ok = (((x[a, None] - x[b]) ** 2 + (y[a, None] - y[b]) ** 2 <= radius ** 2)
+                  & (paint[a, None] == paint[b]) & (np.abs(pos[a, None] - pos[b]) <= max_gap))
+            if offset == 0:
+                ok &= a[:, None] < b
+            i, j = np.nonzero(ok)
+            left.append(a[i])
+            right.append(b[j])
+    i, j = np.concatenate(left), np.concatenate(right)
+    while True:                                   # label propagation with pointer jumping
+        low = np.minimum(labels[i], labels[j])
+        new = labels.copy()
+        np.minimum.at(new, i, low)
+        np.minimum.at(new, j, low)
+        new = new[new]
+        if np.array_equal(new, labels):
+            return labels
+        labels = new
+
+
+def centres(x, y, paint, groups, min_reads):
+    """(x, y, paint, reads) of each constellation with at least min_reads reads."""
+    ids, inverse, sizes = np.unique(groups, return_inverse=True, return_counts=True)
+    keep = sizes >= min_reads
+    cx = np.bincount(inverse, weights=x)[keep] / sizes[keep]
+    cy = np.bincount(inverse, weights=y)[keep] / sizes[keep]
+    cp = np.zeros(len(ids), dtype=int)
+    cp[inverse] = paint                               # one paint per constellation by construction
+    return cx, cy, cp[keep], sizes[keep]
+
+
+def pair_up(cx, cy, cp, reach):
+    """Greedy pairs (i, j) of constellations with different paints whose centres lie within reach."""
+    used, pairs = set(), []
+    for i in range(len(cx)):
+        if i in used:
             continue
-        if args.read_group and rg not in args.read_group:
-            stats["read_group_filtered_records"] += 1
-            continue
-        # Also enforce filters here so the function has identical behaviour on SAM fixtures.
-        if alignment.flag & (4 | 256 | 512 | 1024) or alignment.mapq < args.mapq:
-            stats["filtered_records"] += 1
-            continue
-        if args.exclude_supplementary and alignment.flag & 2048:
-            stats["supplementary_filtered_records"] += 1
-            continue
-        alignment.targets = target_mask(alignment, probes)
-        key = (qname, rg)
-        if key not in points:
-            if len(points) >= args.max_fragments:
-                raise InputError(f"More than {args.max_fragments:,} fragments fetched. Narrow probes/padding or raise --max-fragments.")
-            points[key] = Point(qname, rg, loc)
-        point = points[key]
-        point.alignments.append(alignment)
-        point.targets |= alignment.targets
-        if alignment.flag & 2048:
-            point.supplementary_targets |= alignment.targets
-        else:
-            point.primary_targets |= alignment.targets
-        stats["records_retained"] += 1
-        for tag in alignment.tags:
-            if tag in TAGS:
-                stats[f"tag_{tag}_records"] += 1
-    kept = []
-    for point in points.values():
-        bx_values = {a.tags["BX"] for a in point.alignments if a.tags.get("BX")}
-        point.bx_conflict = len(bx_values) > 1
-        point.bx = next(iter(bx_values)) if len(bx_values) == 1 else None
-        if point.bx_conflict:
-            stats["conflicting_BX_fragments"] += 1
-        if args.haplotype is not None and not any(
-                a.tags.get("HZ" if args.phase_source == "raw" else "HP") == args.haplotype
-                for a in point.alignments):
-            stats["haplotype_filtered_fragments"] += 1
-            continue
-        kept.append(point)
-    kept.sort(key=lambda p: (p.location.tile_key, p.rg, p.qname))
-    stats["fragments_retained"] = len(kept)
-    stats["target_fragments"] = sum(bool(p.targets) for p in kept)
-    stats["context_fragments"] = sum(not p.targets for p in kept)
-    return kept, dict(stats)
+        d = np.hypot(cx - cx[i], cy - cy[i])
+        for j in np.argsort(d):
+            if d[j] > reach:
+                break
+            if j != i and j not in used and cp[j] != cp[i]:
+                used |= {i, int(j)}
+                pairs.append((i, int(j)))
+                break
+    return pairs
 
 
-def load_points(args, probes, windows):
-    with tempfile.TemporaryDirectory(prefix="virtual-fish-") as tmp:
-        bed = Path(tmp) / "windows.bed"
-        bed.write_text("".join(f"{c}\t{a}\t{b}\n" for c, a, b in windows))
-        mask = 4 | 256 | 512 | 1024 | (2048 if args.exclude_supplementary else 0)
-        cmd = [args.samtools, "view", "-M", "-L", str(bed), "-F", str(mask), "-q", str(args.mapq)]
-        if args.reference:
-            cmd += ["-T", args.reference]
-        cmd.append(args.input)
-        # File-backed stderr prevents deadlock if samtools emits many diagnostics.
-        with tempfile.TemporaryFile(mode="w+t") as errors:
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=errors, text=True)
-            try:
-                assert proc.stdout is not None
-                points, stats = collect_points(proc.stdout, probes, args)
-                proc.stdout.close()
-                code = proc.wait()
-            except BaseException:
-                proc.terminate()
-                proc.wait()
-                raise
-            errors.seek(0)
-            diagnostic = errors.read().strip()
-            if code:
-                raise InputError(f"samtools region query failed: {diagnostic}")
-            if diagnostic:
-                print(diagnostic, file=sys.stderr)
-    return points, stats
+def colocalization(data, paints, args):
+    """Lane-wide counts of constellation pairs with different paints on one footprint (centres within
+    2 x --link-radius), per paint pair, with a control that shifts one paint's constellations to the
+    next tiles. Needs every read, so it is skipped when the lane was sampled."""
+    tile, x, y, paint, pos, _ = data["columns"]
+    if not 2 <= len(paints) <= len(PAINT_COLORS) or data["sample"].threshold < 1 << 32 or len(x) > 1_000_000:
+        return None
+    spacing = float(x.max() - x.min()) + 10 * args.link_radius        # keeps tiles apart
+    groups = constellations(x + tile * spacing, y, paint, pos, args.link_radius, args.link_gap)
+    cx, cy, cp, _ = centres(x + tile * spacing, y, paint, groups, args.min_constellation)
+    ct = np.floor(cx / spacing).astype(int)
+    lx = cx - ct * spacing
+    ntiles, reach = len(data["tiles"]), 2 * args.link_radius
+    results = []
+    for a in range(len(paints)):
+        for b in range(a + 1, len(paints)):
+            def count(shift):
+                n = 0
+                for t in np.unique(ct[cp == a]):
+                    pa = (ct == t) & (cp == a)
+                    pb = ((ct + shift) % ntiles == t) & (cp == b)
+                    sel = pa | pb
+                    n += len(pair_up(lx[sel], cy[sel], cp[sel], reach))
+                return n
+            shifts = [s for s in range(1, min(ntiles, 6))]
+            control = np.mean([count(s) for s in shifts]) if shifts else float("nan")
+            results.append(dict(a=paints[a].label, b=paints[b].label, observed=count(0), expected=control,
+                                n_a=int((cp == a).sum()), n_b=int((cp == b).sum())))
+    return results
 
 
-def point_namespace(point):
-    return (*point.location.tile_key, point.rg)
+def paint_raster(rows, cols, paint, shape, colors):
+    """Blend paint colours per pixel; intensity follows read density, with a floor so lone reads show."""
+    npx = shape[0] * shape[1]
+    lin = rows * shape[1] + cols
+    count = np.bincount(lin, minlength=npx).astype(float)
+    image = np.ones((npx, 3))
+    filled = count > 0
+    if filled.any():
+        mean = np.stack([np.bincount(lin, weights=colors[paint, k], minlength=npx)[filled]
+                         for k in range(3)], axis=1) / count[filled, None]
+        alpha = 0.35 + 0.65 * np.clip(count[filled] / np.quantile(count[filled], 0.9), 0, 1)
+        image[filled] = 1 - alpha[:, None] * (1 - mean)
+    return image.reshape(shape[0], shape[1], 3)
 
 
-def near_edges(points, radius, max_edges):
-    """Generate radius neighbours among target fragments in each tile/read group."""
-    grid = collections.defaultdict(list)
-    edges, checks = [], 0
-    for i, p in enumerate(points):
-        if not p.targets:
-            continue
-        loc = p.location
-        cx, cy = math.floor(loc.x / radius), math.floor(loc.y / radius)
-        namespace = point_namespace(p)
-        for dx in (-1, 0, 1):
-            for dy in (-1, 0, 1):
-                for j in grid.get((*namespace, cx + dx, cy + dy), ()):
-                    checks += 1
-                    if checks > max_edges * 100:
-                        raise InputError("Spatial query is too dense. Reduce --radius or narrow probes.")
-                    other = points[j].location
-                    distance = math.hypot(loc.x - other.x, loc.y - other.y)
-                    if distance <= radius:
-                        edges.append((j, i, distance))
-                        if len(edges) > max_edges:
-                            raise InputError(f"More than {max_edges:,} spatial edges; reduce --radius or raise --max-edges.")
-        grid[(*namespace, cx, cy)].append(i)
-    return edges
-
-
-def make_groups(points, edges, mode):
-    has_bx = any(p.bx for p in points if p.targets)
-    selected = ("bx" if has_bx else "spatial") if mode == "auto" else mode
-    buckets = collections.defaultdict(list)
-    if selected == "bx":
-        for i, point in enumerate(points):
-            if point.bx:
-                buckets[(*point_namespace(point), point.bx)].append(i)
-    elif selected == "spatial":
-        parent = list(range(len(points)))
-
-        def root(i):
-            while parent[i] != i:
-                parent[i] = parent[parent[i]]
-                i = parent[i]
-            return i
-
-        for a, b, _ in edges:
-            parent[root(b)] = root(a)
-        for i, point in enumerate(points):
-            if point.targets:
-                buckets[(root(i),)].append(i)
-    groups = []
-    for members in buckets.values():
-        targets = 0
-        for i in members:
-            targets |= points[i].targets
-        if not targets:
-            continue
-        group_id = f"{selected}:{len(groups) + 1}"
-        for i in members:
-            points[i].group = group_id
-        a_only = sum(points[i].targets == 1 for i in members)
-        b_only = sum(points[i].targets == 2 for i in members)
-        groups.append({"id": group_id, "kind": "inferred BX template" if selected == "bx" else "spatial candidate",
-                       "bx": points[members[0]].bx if selected == "bx" else None,
-                       "tile_key": list(points[members[0]].location.tile_key),
-                       "read_group": points[members[0]].rg, "members": members, "targets": targets,
-                       "target_fragments": sum(bool(points[i].targets) for i in members),
-                       "A_only_fragments": a_only, "B_only_fragments": b_only,
-                       "dual_probe_fragments": sum(points[i].targets == 3 for i in members),
-                       "distinct_A_B_support": bool(a_only and b_only)})
-    groups.sort(key=lambda g: (-g["distinct_A_B_support"], -g["target_fragments"], g["id"]))
-    return selected, groups
-
-
-def phase_marker(point, source, kind):
-    tag = "HZ" if source == "raw" else "HP"
-    values = {a.tags[tag] for a in point.alignments if a.tags.get(tag)}
-    if not values:
-        return "x"
-    if (kind == "mrjd" and source == "reported") or len(values) > 1:
-        return "D"
-    value = next(iter(values))
-    return {"1": "o", "2": "s"}.get(value, "D")
-
-
-def detect_kind(points, path, requested):
-    if requested != "auto":
-        return requested
-    if ".mrjd." in Path(path).name.lower() or any(
-            a.tags.get("HP") not in {None, "1", "2"} for p in points for a in p.alignments):
-        return "mrjd"
-    return "germline"
-
-
-def summarize(points, probes, groups, edges, stats, args, header_info, kind, selected):
-    nearby = [(a, b, d) for a, b, d in edges if {points[a].targets, points[b].targets} == {1, 2}]
-    versions = header_info["dragen_versions"]
-    if args.phase_source == "raw":
-        phase_description = "optional pre-VC HZ/pz; no fallback to HP/pp"
-    elif versions and all(v.startswith("4.6") for v in versions):
-        phase_description = "reported HP/pp; DRAGEN 4.6 default is post-VC haplotagging"
-    elif versions and all(v.startswith("4.5") for v in versions):
-        phase_description = "reported HP/pp; DRAGEN 4.5 TruPath uses pre-VC read phasing"
-    else:
-        phase_description = "reported HP/pp; phase stage not inferred from this header"
-    if kind == "mrjd" and args.phase_source == "reported":
-        phase_description = "MRJD HP copy assignments (PC confidence), not germline HP 1/2"
-    warnings = []
-    if stats.get("malformed_or_coordinate_free_records"):
-        warnings.append(f"Skipped {stats['malformed_or_coordinate_free_records']} malformed or coordinate-free records.")
-    if stats.get("conflicting_BX_fragments"):
-        warnings.append("Conflicting BX tags were excluded from template grouping.")
-    if selected == "spatial":
-        warnings.append("Spatial candidates are radius-connected groups, not validated molecules; chains can merge unrelated reads.")
-    if selected == "bx" and not any(p.bx for p in points if p.targets):
-        warnings.append("No target-bearing fragments carry a usable BX tag; all target hits remain visible.")
-    if args.phase_source == "raw" and not any(a.tags.get("HZ") for p in points for a in p.alignments):
-        warnings.append("HZ tags are absent; raw phasing is unavailable. Enable --vc-include-raw-read-phase-scores in DRAGEN to retain them.")
-    if args.phase_source == "reported" and not versions:
-        warnings.append("No DRAGEN version found in @PG; HP stage is unknown.")
-    if kind == "mrjd":
-        warnings.append("MRJD alignments may project copies into several paralog regions; probe membership is not an independent locus-origin assignment.")
-    if any(p.targets and not p.primary_targets for p in points):
-        warnings.append("Some target support comes only from supplementary alignments; see per-alignment evidence in JSON/TSV.")
-    if len(probes) == 2 and probes[0].chrom == probes[1].chrom and (
-            probes[0].start < probes[1].end and probes[1].start < probes[0].end):
-        warnings.append("Probe intervals overlap; dual-probe hits can follow directly from interval overlap.")
-    for i, probe in enumerate(probes):
-        if not any(p.targets & (1 << i) for p in points):
-            warnings.append(f"No retained aligned-base support for probe {probe.label} ({probe.region}).")
-    return {"schema_version": VERSION, "title": args.title or Path(args.input).name,
-            "input": str(Path(args.input).resolve()),
-            "reference": str(Path(args.reference).resolve()) if args.reference else None,
-            "annotation": str(Path(args.annotation).resolve()) if args.annotation else None,
-            "annotation_build": args.annotation_build, "probes": [dataclasses.asdict(p) for p in probes],
-            "coordinate_convention": "0-based half-open genomic intervals; original QNAME X/Y units",
-            "settings": {k: getattr(args, k) for k in ("mapq", "padding", "radius", "grouping", "phase_source", "haplotype", "exclude_supplementary")},
-            "header": header_info, "input_kind": kind, "phase_description": phase_description,
-            "grouping_used": selected, "counts": {**stats,
-                "A_fragments": sum(bool(p.targets & 1) for p in points),
-                "B_fragments": sum(bool(p.targets & 2) for p in points),
-                "dual_probe_fragments": sum(p.targets == 3 for p in points),
-                "target_tiles": len({p.location.tile_key for p in points if p.targets}),
-                "groups": len(groups), "groups_with_distinct_A_B_support": sum(g["distinct_A_B_support"] for g in groups),
-                "nearby_A_only_B_only_pairs": len(nearby)},
-            "interpretation": "Exploratory flowcell visualization. Neighbour counts have no calibrated significance; grouping and phase labels are inferred. Query windows do not recover complete templates.",
-            "warnings": warnings}, nearby
-
-
-def write_tables(prefix, points, groups, nearby, summary):
-    prefix.parent.mkdir(parents=True, exist_ok=True)
-    with open(str(prefix) + ".points.tsv", "w", newline="") as handle:
-        columns = ["point_id", "qname", "RG", "instrument", "run", "flowcell", "lane", "tile", "x", "y",
-                   "targets", "primary_targets", "supplementary_targets", "BX", "BX_conflict", "group", "phase_records"]
-        writer = csv.DictWriter(handle, fieldnames=columns, delimiter="\t")
-        writer.writeheader()
-        for i, p in enumerate(points):
-            writer.writerow({"point_id": i, "qname": p.qname, "RG": p.rg, **dataclasses.asdict(p.location),
-                             "targets": p.targets, "primary_targets": p.primary_targets,
-                             "supplementary_targets": p.supplementary_targets, "BX": p.bx or "",
-                             "BX_conflict": p.bx_conflict, "group": p.group or "",
-                             "phase_records": json.dumps([{ "chrom": a.chrom, "start": a.start,
-                                  "flag": a.flag, **a.tags} for a in p.alignments], separators=(",", ":"))})
-    with open(str(prefix) + ".groups.tsv", "w", newline="") as handle:
-        columns = ["id", "kind", "bx", "tile_key", "read_group", "target_fragments", "A_only_fragments", "B_only_fragments", "dual_probe_fragments", "distinct_A_B_support", "members"]
-        writer = csv.DictWriter(handle, fieldnames=columns, delimiter="\t", extrasaction="ignore")
-        writer.writeheader()
-        for g in groups:
-            writer.writerow({**g, "tile_key": json.dumps(g["tile_key"]), "members": ",".join(map(str, g["members"]))})
-    with open(str(prefix) + ".nearby.tsv", "w", newline="") as handle:
-        writer = csv.writer(handle, delimiter="\t")
-        writer.writerow(["A_point_id", "B_point_id", "distance_QNAME_units", "same_BX_group"])
-        for a, b, distance in nearby:
-            if points[a].targets == 2:
-                a, b = b, a
-            same = bool(points[a].group and points[a].group == points[b].group and points[a].group.startswith("bx:"))
-            writer.writerow([a, b, f"{distance:.6f}", same])
-    payload = {**summary, "groups": groups, "points": [dataclasses.asdict(p) for p in points]}
-    Path(str(prefix) + ".json").write_text(json.dumps(payload, indent=2) + "\n")
-
-
-def scatter_points(ax, points, source, kind, large=False):
-    buckets = collections.defaultdict(list)
-    for p in points:
-        buckets[(p.targets, phase_marker(p, source, kind))].append(p)
-    for (targets, marker), members in sorted(buckets.items()):
-        size = (65 if large else 18) if targets else (14 if large else 5)
-        ax.scatter([p.location.x for p in members], [p.location.y for p in members],
-                   c=COLORS[targets], marker=marker, s=size, alpha=.9 if targets else .25,
-                   linewidths=.7, zorder=3 if targets else 1)
-    for p in points:
-        if p.targets and p.supplementary_targets & ~p.primary_targets:
-            ax.scatter([p.location.x], [p.location.y], s=95 if large else 34,
-                       facecolors="none", edgecolors="#222", linewidths=.75, zorder=4)
-
-
-def fit_xy(ax, points):
-    if not points:
-        ax.set_xlim(0, 1)
-        ax.set_ylim(0, 1)
-    else:
-        xs, ys = [p.location.x for p in points], [p.location.y for p in points]
-        extent = max(max(xs) - min(xs), max(ys) - min(ys), 100)
-        half = extent * .58
-        cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
-        ax.set_xlim(cx - half, cx + half)
-        ax.set_ylim(cy - half, cy + half)
-    ax.set_aspect("equal", adjustable="box")
-    ax.ticklabel_format(style="plain", useOffset=False)
-    ax.set_xlabel("X · read-name units", fontsize=8)
-    ax.set_ylabel("Y · read-name units", fontsize=8)
-    ax.tick_params(labelsize=7)
-    ax.grid(alpha=.13)
-
-
-def plot_outputs(prefix, points, probes, groups, summary, args):
+def plot(data, paints, args, out):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patheffects as effects
     from matplotlib.lines import Line2D
+    from matplotlib.patches import Rectangle
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "axes.spines.top": False,
                          "axes.spines.right": False, "svg.fonttype": "none"})
-    kind = summary["input_kind"]
-    labels = {0: "queried context", 1: probes[0].label}
-    if len(probes) == 2:
-        labels.update({2: probes[1].label, 3: "both probes · one read pair"})
-    legend = [Line2D([], [], color=COLORS[k], marker="o", ls="", label=v) for k, v in labels.items()]
-    phase_tag = "HZ" if args.phase_source == "raw" else "HP"
-    if kind == "germline" or args.phase_source == "raw":
-        legend += [Line2D([], [], color="#555", marker=m, ls="", label=l)
-                   for m, l in [("o", f"{phase_tag} 1"), ("s", f"{phase_tag} 2"), ("x", "unassigned"), ("D", "mixed labels")]]
+    tile, x, y, paint, pos, digest = data["columns"]
+    colors = paint_colors(len(paints))
+    names, sample = data["tiles"], data["sample"]
+    zoom = data["zoom_tile"]
+    x0, x1, y0, y1 = int(x.min()), int(x.max()) + 1, int(y.min()), int(y.max()) + 1
+    xr, yr = x1 - x0, y1 - y0
+    ink, muted = "#111827", "#4b5563"
+
+    # --- lane overview raster: Y runs along the lane, X across the swath -------------------------
+    layout, physical = tile_layout(names)
+    surfaces = sorted({s for s, _, _ in layout})
+    swaths = sorted({w for _, w, _ in layout})
+    ncols = max(num for _, _, num in layout)
+    cw = int(min(40, max(4, 2400 // ncols)))
+    ch = int(max(3, round(cw * xr / yr)))
+    gap = max(2, ch // 2)
+    rows = [(s, w) for s in surfaces for w in swaths]
+    top = {sw: r * ch + surfaces.index(sw[0]) * gap for r, sw in enumerate(rows)}
+    shape = (len(rows) * ch + (len(surfaces) - 1) * gap, ncols * cw)
+    tile_top = np.array([top[(s, w)] for s, w, _ in layout])
+    tile_left = np.array([(num - 1) * cw for _, _, num in layout])
+    overview = digest.astype(np.int64) < sample.threshold
+    t = tile[overview]
+    cols = tile_left[t] + np.clip(((y[overview] - y0) / yr * cw).astype(int), 0, cw - 1)
+    rws = tile_top[t] + np.clip(((x1 - 1 - x[overview]) / xr * ch).astype(int), 0, ch - 1)
+    lane_image = paint_raster(rws, cols, paint[overview], shape, colors)
+
+    # --- zoom tile and window ------------------------------------------------------------------
+    on_tile = tile == zoom
+    tx, ty, tp, tpos = x[on_tile], y[on_tile], paint[on_tile], pos[on_tile]
+    dots = len(tx) <= 300_000          # sparse tiles as dots; full real tiles as a density raster
+    if not dots:
+        tw = 900
+        th = max(50, int(round(tw * xr / yr)))
+        tile_image = paint_raster(np.clip(((x1 - 1 - tx) / xr * th).astype(int), 0, th - 1),
+                                  np.clip(((ty - y0) / yr * tw).astype(int), 0, tw - 1), tp, (th, tw), colors)
+    size = args.window_size
+    cx, cy = data["window_center"]
+    wx0, wy0 = cx - size / 2, cy - size / 2
+    inside = (tx >= wx0) & (tx < wx0 + size) & (ty >= wy0) & (ty < wy0 + size)
+    wx, wy, wp, wpos = tx[inside], ty[inside], tp[inside], tpos[inside]
+    groups = (constellations(wx, wy, wp, wpos, args.link_radius, args.link_gap)
+              if len(wx) <= 200_000 else np.arange(len(wx)))
+    group_ids, group_sizes = np.unique(groups, return_counts=True)
+    big = group_ids[group_sizes >= args.min_constellation]
+    in_big = np.isin(groups, big)
+    data["window"] = dict(reads=len(wx), constellations=len(big), share=in_big.mean() if len(wx) else 0)
+
+    # --- figure ---------------------------------------------------------------------------------
+    lane_h = 13.2 * shape[0] / shape[1] + 0.5
+    row_h = max(4.2, min(7.5, 8.2 * xr / yr))
+    ncol = min(len(paints), 4 if len(paints) <= 8 else 8)
+    header = 0.95 + 0.24 * math.ceil(len(paints) / ncol) + (0.3 if data.get("colocalization") else 0)
+    fig_h = header + lane_h + row_h + 1.2
+    fig = plt.figure(figsize=(14, fig_h))
+    grid = fig.add_gridspec(2, 2, height_ratios=[lane_h, row_h], width_ratios=[1.65, 1],
+                            hspace=0.9 / ((lane_h + row_h) / 2), wspace=0.12, left=0.06, right=0.98,
+                            top=1 - header / fig_h, bottom=0.6 / fig_h)
+    lane_ax = fig.add_subplot(grid[0, :])
+    lane_ax.imshow(lane_image, interpolation="nearest", aspect="equal")
+    for c in range(1, ncols):
+        lane_ax.axvline(c * cw - 0.5, color="#e5e7eb", lw=0.4)
+    for sw in rows:
+        lane_ax.axhline(top[sw] - 0.5, color="#d1d5db", lw=0.5)
+        lane_ax.axhline(top[sw] + ch - 0.5, color="#d1d5db", lw=0.5)
+    zs, zw, zn = layout[zoom]
+    lane_ax.add_patch(Rectangle(((zn - 1) * cw - 0.5, top[(zs, zw)] - 0.5), cw, ch,
+                                fill=False, ec=ink, lw=1.4))
+    step = 10 if ncols > 30 else 5 if ncols > 10 else 1
+    ticks = [n for n in range(1, ncols + 1) if n == 1 or n % step == 0]
+    lane_ax.set_xticks([(n - 0.5) * cw for n in ticks], [str(n) for n in ticks])
+    lane_ax.set_yticks([top[sw] + ch / 2 for sw in rows], [f"{s}·{w}" for s, w in rows])
+    lane_ax.set_xlabel("tile number" if physical else "tile (name order)", fontsize=9)
+    lane_ax.set_ylabel("surface·swath" if physical else "row", fontsize=9)
+    lane_ax.tick_params(labelsize=7, length=0)
+    for side in lane_ax.spines.values():
+        side.set_visible(False)
+    share = sample.threshold / (1 << 32)
+    lane_ax.set_title(f"Lane {data['lane'][0]}:{data['lane'][1]} · {len(names)} tiles · colour = paint mix, "
+                      f"intensity = read density"
+                      + ("" if share >= 1 else f" · uniform {share:.3g} sample"),
+                      fontsize=9, color=muted, loc="left")
+    if data.get("colocalization"):
+        fig.text(0.06, 1 - 0.7 / fig_h - 0.24 * math.ceil(len(paints) / ncol) / fig_h,
+                 "Co-localized constellations (one footprint, both paints): " + "; ".join(
+                     f"{r['a']}+{r['b']} {r['observed']:,} (≈{r['expected']:.1f} by chance)"
+                     for r in sorted(data["colocalization"], key=lambda r: r["expected"] - r["observed"])[:3])
+                 + ("; more in the console output" if len(data["colocalization"]) > 3 else ""),
+                 fontsize=9, color=ink, ha="left", va="top")
+
+    tile_ax = fig.add_subplot(grid[1, 0])
+    if dots:
+        shuffle = np.random.default_rng(1).permutation(len(tx))
+        tile_ax.scatter(ty[shuffle], tx[shuffle], c=colors[tp[shuffle]], linewidths=0, rasterized=True,
+                        s=float(np.clip(4e4 / max(len(tx), 1), 0.3, 5)))
+        tile_ax.set_xlim(y0, y1)
+        tile_ax.set_ylim(x0, x1)
+        tile_ax.set_aspect("equal")
     else:
-        legend += [Line2D([], [], color="#555", marker="D", ls="", label="MRJD copy label"),
-                   Line2D([], [], color="#555", marker="x", ls="", label="unassigned")]
-    tiles = sorted({p.location.tile_key for p in points if p.targets})
-    files = []
-    for page in range(max(1, math.ceil(len(tiles) / args.tiles_per_page))):
-        chosen = tiles[page * args.tiles_per_page:(page + 1) * args.tiles_per_page]
-        columns = min(3, max(1, len(chosen)))
-        rows = max(1, math.ceil(len(chosen) / columns))
-        fig, axes = plt.subplots(rows, columns, figsize=(5 * columns, 4.5 * rows + 1.2), squeeze=False)
-        for ax, tile in zip(axes.flat, chosen):
-            members = [p for p in points if p.location.tile_key == tile]
-            scatter_points(ax, members, args.phase_source, kind)
-            fit_xy(ax, members)
-            inst, run, fc, lane, number = tile
-            counts = collections.Counter(p.targets for p in members)
-            ax.set_title(f"{fc} · run {run} · lane {lane} · tile {number}\n"
-                         f"A {counts[1] + counts[3]}  B {counts[2] + counts[3]}  context {counts[0]}", fontsize=9)
-        for ax in list(axes.flat)[len(chosen):]:
-            ax.set_axis_off()
-        if not chosen:
-            axes[0, 0].text(.5, .5, "No retained probe hits", ha="center", va="center", transform=axes[0, 0].transAxes)
-        fig.suptitle(f"TruPath virtual probes · {summary['title']}", fontsize=15, y=.99)
-        fig.legend(handles=legend, loc="upper center", bbox_to_anchor=(.5, .95), ncol=min(4, len(legend)), fontsize=8)
-        fig.text(.5, .018, "Tile panels show queried extents; each tile has its own scale. DNA locations after extraction.\n" + summary["phase_description"], ha="center", fontsize=8, color="#555")
-        fig.tight_layout(rect=(0, .12, 1, .85 if rows == 1 else .91))
-        suffix = ".atlas" + (f".{page + 1:03d}" if len(tiles) > args.tiles_per_page else "")
-        for fmt in ("png", "svg"):
-            out = str(prefix) + suffix + "." + fmt
-            fig.savefig(out, dpi=args.dpi, facecolor="white")
-            files.append(out)
-        plt.close(fig)
-    chosen_groups = [g for g in groups if g["target_fragments"] >= args.min_group_reads][:args.top]
-    if chosen_groups:
-        n = len(chosen_groups)
-        fig = plt.figure(figsize=(15, 3.2 * n + 1.0))
-        grid = fig.add_gridspec(n, 1 + len(probes), width_ratios=[1.25] + [1] * len(probes))
-        for row, g in enumerate(chosen_groups):
-            members = [points[i] for i in g["members"]]
-            ax = fig.add_subplot(grid[row, 0])
-            scatter_points(ax, members, args.phase_source, kind, large=True)
-            fit_xy(ax, members)
-            bx_label = (g["bx"][:42] + "…") if g["bx"] and len(g["bx"]) > 42 else g["bx"]
-            _, run, flowcell, lane, tile = g["tile_key"]
-            ax.set_title(f"{g['id']} · {g['kind']}\n"
-                         f"{bx_label or 'radius connected'} · {g['target_fragments']} target pairs\n"
-                         f"{flowcell} · run {run} · lane {lane} · tile {tile}", fontsize=8)
-            for col, probe in enumerate(probes, 1):
-                b = fig.add_subplot(grid[row, col])
-                b.axvspan(probe.start + 1, probe.end, color=COLORS[1 << (col - 1)], alpha=.12)
-                offsets = []
-                for offset, point in enumerate(members):
-                    for alignment in point.alignments:
-                        if alignment.chrom != probe.chrom:
-                            continue
-                        for start, end in alignment.blocks:
-                            if start >= probe.end + args.padding or end <= probe.start - args.padding:
-                                continue
-                            b.plot([start + 1, end], [offset, offset], color=COLORS[point.targets],
-                                   lw=2, ls="--" if alignment.flag & 2048 else "-", alpha=.9)
-                            offsets.append(offset)
-                lo, hi = max(1, probe.start + 1 - args.padding), probe.end + args.padding
-                b.set_xlim(lo - .5, hi + .5)
-                b.set_ylim(-1, max(offsets, default=0) + 1)
-                b.set_title(f"{probe.label}\n{probe.region}", fontsize=9)
-                b.set_xlabel(f"{probe.chrom} · genomic position (bp)", fontsize=8)
-                b.set_ylabel("read-pair row", fontsize=8)
-                b.ticklabel_format(style="plain", useOffset=False)
-                b.tick_params(labelsize=7)
-                b.grid(alpha=.13)
-        fig.suptitle(f"Target-bearing groups · {summary['title']}", fontsize=14, y=.997)
-        fig.text(.5, .008, "Colours mark probe membership; dashed genomic segments are supplementary. Groups and haplotypes are inferred.", ha="center", fontsize=8, color="#555")
-        fig.tight_layout(rect=(0, .035, 1, .97))
-        for fmt in ("png", "svg"):
-            out = str(prefix) + ".groups." + fmt
-            fig.savefig(out, dpi=args.dpi, facecolor="white")
-            files.append(out)
-        plt.close(fig)
-    return files
+        tile_ax.imshow(tile_image, interpolation="nearest", extent=(y0, y1, x0, x1), aspect="equal")
+    tile_ax.add_patch(Rectangle((wy0, wx0), size, size, fill=False, ec=ink, lw=1.2))
+    tile_ax.set_title(f"Tile {names[zoom]} · all {len(tx):,} painted read pairs", fontsize=9,
+                      color=muted, loc="left")
+    win_ax = fig.add_subplot(grid[1, 1])
+    order = np.random.default_rng(0).permutation(len(wx))
+    win_ax.scatter(wy[order], wx[order], c=colors[wp[order]], s=10, linewidths=0, rasterized=True)
+    # Label each constellation (with two or more paints); two of different paints on one footprint
+    # get one joint label.
+    gx, gy, gp, _ = centres(wx, wy, wp, groups, args.min_constellation)
+    if len(paints) == 1:
+        gx = gx[:0]
+    pairs = pair_up(gx, gy, gp, 2 * args.link_radius) if len(paints) <= 8 else []
+    paired = {i for pair in pairs for i in pair}
+    labels = [(gx[[i, j]].mean(), gy[[i, j]].mean(),
+               "+".join(paints[k].label for k in sorted((gp[i], gp[j])))) for i, j in pairs]
+    labels += [(gx[i], gy[i], paints[gp[i]].label) for i in range(len(gx)) if i not in paired]
+    for lx, ly, label in labels:
+        text = win_ax.text(ly, lx, re.sub(r"(^|\+)chr", r"\1", label), fontsize=7, color=ink,
+                           ha="center", va="center")
+        text.set_path_effects([effects.withStroke(linewidth=2.4, foreground="white")])
+    win_ax.set_xlim(wy0, wy0 + size)
+    win_ax.set_ylim(wx0, wx0 + size)
+    win_ax.set_aspect("equal")
+    win = data["window"]
+    win_ax.set_title(f"Window · {win['constellations']} constellations (≥{args.min_constellation} reads) "
+                     f"hold {win['share']:.0%} of {win['reads']:,}", fontsize=9, color=muted, loc="left")
+    for ax in (tile_ax, win_ax):
+        ax.ticklabel_format(style="plain", useOffset=False)
+        ax.tick_params(labelsize=7)
+        ax.set_xlabel("Y · read-name units (along the lane)", fontsize=8)
+    tile_ax.set_ylabel("X · read-name units", fontsize=8)
+
+    title = args.title or f"Virtual FISH · {Path(args.input).name}"
+    fig.text(0.06, 1 - 0.1 / fig_h, title, fontsize=14, fontweight="bold", ha="left", va="top")
+    total = sum(data["totals"])
+    fig.text(0.06, 1 - 0.45 / fig_h, f"{total:,} painted read pairs in lane {data['lane'][0]}:{data['lane'][1]} · "
+                                     f"MAPQ ≥ {args.mapq} · each dot is one read pair at its nanowell",
+             fontsize=9, color=muted, ha="left", va="top")
+    handles = [Line2D([], [], ls="", marker="o", markersize=6, markerfacecolor=colors[i],
+                      markeredgewidth=0, label=f"{p.label} ({data['totals'][i]:,})")
+               for i, p in enumerate(paints)]
+    fig.legend(handles=handles, loc="upper left", bbox_to_anchor=(0.055, 1 - 0.7 / fig_h), frameon=False,
+               ncol=ncol, fontsize=8, handletextpad=0.2, columnspacing=1.2, borderaxespad=0)
+    fig.savefig(out, dpi=args.dpi, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+
+
+def choose_zoom(data, args):
+    """Zoom tile: --tile, else the protected first tile if the sample was thinned, else the tile with
+    the densest spot. Window: --window, else the densest spot on that tile."""
+    tile, x, y = data["columns"][:3]
+    sample = data["sample"]
+    bounds = ((x.min(), x.max() + 1), (y.min(), y.max() + 1))
+    size = args.window_size
+    if args.tile or sample.threshold < 1 << 32:
+        zoom = sample.protected
+    else:
+        best = -1
+        for t in np.unique(tile):
+            on = tile == t
+            cx, cy = densest(x[on], y[on], size, bounds)
+            n = int(((np.abs(x[on] - cx) < size / 2) & (np.abs(y[on] - cy) < size / 2)).sum())
+            if n > best:
+                best, zoom = n, int(t)
+    on = tile == zoom
+    if args.window:
+        cx, cy = args.window
+        (xa, xb), (ya, yb) = bounds
+        if not (xa <= cx <= xb and ya <= cy <= yb):
+            raise InputError(f"--window {cx:g},{cy:g} lies outside the tiles (X {xa:,}-{xb:,}, Y {ya:,}-{yb:,}).")
+    else:
+        cx, cy = densest(x[on], y[on], size, bounds)
+    data["zoom_tile"], data["window_center"] = zoom, (cx, cy)
+
+
+def default_output(args, paints, genome):
+    stem = Path(args.input).name
+    for ext in (".cram", ".bam", ".sam"):
+        if stem.endswith(ext):
+            stem = stem[: -len(ext)]
+    tag = "all" if genome else "_".join(re.sub(r"[^\w.-]+", "_", p.label.replace(",", "")) for p in paints)
+    return f"{stem}.fish.{tag}.png"
 
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--input", "--cram", "--bam", dest="input", required=True, help="Indexed, coordinate-sorted BAM/CRAM.")
-    p.add_argument("--reference", "-T", help="Matching reference FASTA; required for CRAM.")
-    p.add_argument("--region", action="append", default=[], help="One or two [LABEL=]chr:start-end intervals; repeat this option.")
-    p.add_argument("--gene", action="append", default=[], help="Exact gene symbol/ID; repeat for two genes. SYMBOL@contig disambiguates.")
-    p.add_argument("--genes", nargs="+", default=[], help="Alternative to repeated --gene.")
-    p.add_argument("--annotation", help="Reference-matched GTF/GFF3, optionally gzip-compressed.")
-    p.add_argument("--annotation-build", help="Annotation build label recorded in provenance, e.g. GRCh38. No liftover is performed.")
-    p.add_argument("--out-prefix", default="virtual_fish", help="Prefix for PNG/SVG/TSV/JSON outputs.")
-    p.add_argument("--title", help="Plot title; defaults to the input filename.")
-    p.add_argument("--mapq", type=int, default=20, help="Minimum ordinary SAM MAPQ (not the xq tag); default 20.")
-    p.add_argument("--padding", type=int, default=10000, help="Genomic context around probes; does not expand probe membership. Default 10000 bp.")
-    p.add_argument("--grouping", choices=("auto", "bx", "spatial", "none"), default="auto", help="Auto uses BX if present on targets, otherwise exploratory spatial groups.")
-    p.add_argument("--radius", type=float, default=350, help="Spatial neighbour radius in QNAME coordinate units; default 350. No genomic distance cutoff.")
-    p.add_argument("--phase-source", choices=("reported", "raw"), default="reported", help="Reported HP/pp, or optional pre-VC HZ/pz. Raw never substitutes HP.")
-    p.add_argument("--haplotype", help="Keep a fragment if any fetched alignment has this exact HP (or HZ in raw mode), including MRJD copy strings.")
-    p.add_argument("--input-kind", choices=("auto", "germline", "mrjd"), default="auto", help="MRJD HP is a copy label, not the germline numeric haplotype.")
-    p.add_argument("--read-group", action="append", default=[], help="Restrict to exact RG IDs; repeat as needed.")
-    p.add_argument("--exclude-supplementary", action="store_true", help="Exclude supplementary evidence; by default it is retained without counting another point.")
-    p.add_argument("--max-fragments", type=int, default=500000, help="Memory guard: fail rather than silently downsample. Default 500000.")
-    p.add_argument("--max-edges", type=int, default=1000000, help="Density guard for spatial radius edges; default 1000000.")
-    p.add_argument("--top", type=int, default=8, help="Number of group zooms; every probe hit remains in the atlas. Default 8.")
-    p.add_argument("--min-group-reads", type=int, default=2, help="Minimum target read pairs for a zoom; default 2.")
-    p.add_argument("--tiles-per-page", type=int, default=12, help="Atlas pagination; default 12 tiles per PNG/SVG page.")
-    p.add_argument("--dpi", type=int, default=160)
-    p.add_argument("--tables-only", action="store_true", help="Write TSV/JSON without plotting or requiring matplotlib.")
-    p.add_argument("--samtools", default="samtools", help="Path/name of samtools executable.")
-    p.add_argument("--version", action="version", version=VERSION)
+    p.add_argument("--input", "--cram", "--bam", dest="input", required=True,
+                   help="Indexed, coordinate-sorted BAM/CRAM with original Illumina read names.")
+    p.add_argument("--reference", "-T", help="Reference FASTA; required for CRAM.")
+    p.add_argument("--paint", action="append", default=[],
+                   help="chrom, chrom:start-end (1-based, inclusive) or LABEL=chrom:start-end; repeat for up "
+                        "to 8 paints. Default: every primary chromosome.")
+    p.add_argument("--lane", help="Lane to draw: a lane number or FLOWCELL:LANE. Default: the first lane in the file.")
+    p.add_argument("--tile", help="Tile to zoom into, e.g. 1205. Default: the densest spot when every read "
+                                  "fits in --max-points, otherwise the first tile with a painted read.")
+    p.add_argument("--window", help="Window centre on the zoom tile as X,Y (read-name units). Default: the densest spot.")
+    p.add_argument("--window-size", type=float, default=3000,
+                   help="Window width in read-name units (default 3000).")
+    p.add_argument("--link-radius", type=float, default=350,
+                   help="Constellation link distance on the flow cell, read-name units (default 350).")
+    p.add_argument("--link-gap", type=int, default=500_000,
+                   help="Constellation link distance in the genome, bp (default 500,000).")
+    p.add_argument("--min-constellation", type=int, default=4,
+                   help="Reads needed to label a constellation in the window (default 4).")
+    p.add_argument("--mapq", type=int, default=20, help="Minimum MAPQ (default 20).")
+    p.add_argument("--keep-duplicates", action="store_true", help="Keep reads flagged as duplicates.")
+    p.add_argument("--max-points", type=int, default=4_000_000,
+                   help="Reads kept for the lane overview; beyond this a uniform sample is drawn. The zoom "
+                        "tile always keeps every read (default 4,000,000).")
+    p.add_argument("--subsample", type=float,
+                   help="Pass only this fraction of reads through samtools, for a quick look (thins the zoom too).")
+    p.add_argument("--threads", type=int, default=2, help="samtools decompression threads (default 2).")
+    p.add_argument("-o", "--out", help="Output image (.png/.pdf/.svg). Default: <input>.fish.<paints>.png")
+    p.add_argument("--title", help="Plot title (default: 'Virtual FISH · <input name>').")
+    p.add_argument("--dpi", type=int, default=200)
+    p.add_argument("--samtools", default="samtools", help="Path/name of the samtools executable.")
     args = p.parse_args(argv)
-    if not 1 <= len(args.region) + len(args.gene) + len(args.genes) <= 2:
-        p.error("Specify one or two probes using --region, --gene or --genes.")
-    if (args.gene or args.genes) and not args.annotation:
-        p.error("--gene/--genes requires --annotation.")
     if Path(args.input).suffix.lower() == ".cram" and not args.reference:
         p.error("CRAM input requires --reference.")
-    if not 0 <= args.mapq <= 255 or args.padding < 0:
-        p.error("--mapq must be 0..255 and --padding must be non-negative.")
-    if not math.isfinite(args.radius) or args.radius <= 0:
-        p.error("--radius must be finite and positive.")
-    if any(getattr(args, k) < 1 for k in ("max_fragments", "max_edges", "top", "min_group_reads", "tiles_per_page", "dpi")):
-        p.error("Limits, --top, --min-group-reads, --tiles-per-page and --dpi must be positive.")
+    if len(args.paint) > len(PAINT_COLORS):
+        p.error(f"At most {len(PAINT_COLORS)} paints; omit --paint to paint every chromosome.")
+    if args.window:
+        try:
+            wx, wy = args.window.split(",")
+            args.window = (float(wx), float(wy))
+        except ValueError:
+            p.error("--window must be X,Y without thousands separators, e.g. --window 12000,30500.")
+    if not 0 <= args.mapq <= 255:
+        p.error("--mapq must be 0..255.")
+    if args.subsample is not None and not 0 < args.subsample < 1:
+        p.error("--subsample must be between 0 and 1.")
+    if min(args.window_size, args.link_radius) <= 0 or min(args.max_points, args.min_constellation,
+                                                          args.threads, args.dpi) < 1 or args.link_gap < 0:
+        p.error("Sizes, distances and counts must be positive.")
     return args
 
 
@@ -732,46 +658,49 @@ def main(argv=None):
     try:
         if not shutil.which(args.samtools):
             raise InputError(f"samtools executable not found: {args.samtools}")
-        for name in ("input", "reference", "annotation"):
-            value = getattr(args, name)
-            if value and not Path(value).is_file():
-                raise InputError(f"{name} file not found: {value}")
-        if not args.tables_only:
-            try:
-                import matplotlib  # noqa: F401
-            except ImportError:
-                raise InputError("Install matplotlib, or use --tables-only.") from None
-        probes = [parse_region(value) for value in args.region]
-        probes += resolve_genes(args.annotation, args.gene + args.genes) if args.gene or args.genes else []
-        if len({p.label for p in probes}) != len(probes):
-            raise InputError("Probe labels must be distinct; use explicit LABEL=region names.")
-        header_cmd = [args.samtools, "view", "-H"]
-        if args.reference:
-            header_cmd += ["-T", args.reference]
-        header = run_capture(header_cmd + [args.input])
-        contigs, header_info = parse_header(header)
-        probes = prepare_probes(probes, contigs)
-        windows = query_windows(probes, args.padding, contigs)
-        print("Probes: " + "; ".join(f"{p.label}={p.region}" for p in probes))
-        points, stats = load_points(args, probes, windows)
-        if not stats.get("records_retained") and stats.get("malformed_or_coordinate_free_records"):
-            raise InputError("No usable coordinate-bearing records. Check that original Illumina QNAMEs were retained in this file.")
-        # Explicit haplotype filters must not silently produce an empty result when tags are unavailable.
-        if args.haplotype is not None and not points:
-            raise InputError("No fragments match --haplotype in the fetched windows; check phase source and tags.")
-        kind = detect_kind(points, args.input, args.input_kind)
-        edges = near_edges(points, args.radius, args.max_edges)
-        selected, groups = make_groups(points, edges, args.grouping)
-        summary, nearby = summarize(points, probes, groups, edges, stats, args, header_info, kind, selected)
-        summary["query_windows"] = [{"chrom": c, "start": a, "end": b} for c, a, b in windows]
-        prefix = Path(args.out_prefix)
-        write_tables(prefix, points, groups, nearby, summary)
-        plots = [] if args.tables_only else plot_outputs(prefix, points, probes, groups, summary, args)
-        print(f"Retained {stats['target_fragments']:,} target fragments across {summary['counts']['target_tiles']} tiles; grouping={selected}.")
-        print(summary["phase_description"])
-        for warning in summary["warnings"]:
-            print("Note: " + warning, file=sys.stderr)
-        print(f"Wrote {prefix}.json, .points.tsv, .groups.tsv, .nearby.tsv" + (f" and {len(plots)} plots." if plots else "."))
+        for name in (args.input, args.reference):
+            if name and not Path(name).is_file():
+                raise InputError(f"File not found: {name}")
+        contigs = read_contigs(args)
+        genome = not args.paint
+        if genome:
+            paints = [Paint(c, c, 0, n, True) for c, n in contigs.items() if PRIMARY.fullmatch(c)]
+            if not paints:
+                raise InputError("No primary chromosomes (1-22, X, Y) in the header; use --paint.")
+        else:
+            paints = [parse_paint(v, contigs) for v in args.paint]
+            check_overlaps(paints)
+            if len({p.label for p in paints}) < len(paints):
+                raise InputError("Paint labels must be distinct.")
+        print("paints: " + ", ".join(p.label if p.whole and p.label == p.chrom
+                                     else f"{p.label}={p.chrom}:{p.start + 1:,}-{p.end:,}" for p in paints))
+        data = collect(args, paints)
+        choose_zoom(data, args)
+        data["colocalization"] = colocalization(data, paints, args)
+        out = args.out or default_output(args, paints, genome)
+        plot(data, paints, args, out)
+        lane = f"{data['lane'][0]}:{data['lane'][1]}"
+        others = [f"{fc}:{ln} ({n:,})" for (fc, ln), n in sorted(data["lanes"].items()) if f"{fc}:{ln}" != lane]
+        print(f"lane {lane}: {sum(data['totals']):,} painted read pairs on {len(data['tiles'])} tiles"
+              + (f"; other lanes in the file: {', '.join(others)}" if others else ""))
+        share = data["sample"].threshold / (1 << 32)
+        if share < 1:
+            print(f"lane overview drawn from a uniform {share:.3g} sample (--max-points {args.max_points:,})")
+        if data["bad"]:
+            print(f"skipped {data['bad']:,} reads whose names lack flow-cell coordinates", file=sys.stderr)
+        for r in data["colocalization"] or []:
+            print(f"co-localized {r['a']}+{r['b']}: {r['observed']:,} constellation pairs on one footprint "
+                  f"(≈{r['expected']:.1f} expected by chance; {r['n_a']:,} {r['a']} and {r['n_b']:,} {r['b']} "
+                  f"constellations of ≥{args.min_constellation} reads)")
+        if 2 <= len(paints) <= len(PAINT_COLORS) and data["colocalization"] is None:
+            print("co-localization not counted: it needs every read of the lane (raise --max-points, "
+                  "or paint smaller regions)")
+        w = data["window"]
+        cx, cy = data["window_center"]
+        print(f"zoom: tile {data['tiles'][data['zoom_tile']]}, window centre X={cx:,.0f} Y={cy:,.0f}: "
+              f"{w['reads']:,} read pairs, {w['constellations']} constellations of ≥{args.min_constellation} "
+              f"reads holding {w['share']:.0%} of them")
+        print(f"wrote {out}")
         return 0
     except (InputError, OSError) as exc:
         print(f"error: {exc}", file=sys.stderr)

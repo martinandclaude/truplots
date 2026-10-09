@@ -12,5 +12,5 @@ dependencies:
   - pysam                 # VCF reading in plot_vaf.py
   - h5py                  # cooler (HDF5) reading in plot_colocation.py
   # command-line tools: CRAM/BAM access + panel building
-  - samtools=1.21         # plot_molecule.py
+  - samtools=1.21         # plot_molecule.py, plot_virtual_fish.py
   - htslib=1.21           # provides bgzip + tabix
