@@ -21,6 +21,11 @@
 *.png
 *.pdf
 *.svg
+*.cool
+*.cooler
+*.mcool
+*.mcooler
+*.hic
 
 # Python
 __pycache__/
