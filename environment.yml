@@ -1,4 +1,4 @@
-name: trupath-qc
+name: truplot
 channels:
   - conda-forge
   - bioconda
