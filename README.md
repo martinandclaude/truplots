@@ -116,6 +116,15 @@ Three views:
 - **several regions** (`--region` repeated): the regions are placed side by side on both axes, so the
   off-diagonal blocks show signal between them.
 
+**SV call overlay** (`--sv-vcf sample.sv.vcf.gz`): DRAGEN SV calls are marked at their breakpoint
+pairs: DEL, DUP and INV at (POS, END), and BND at (POS, mate position), with each mate pair drawn once.
+Each type gets its own colour and marker shape. Calls go in the upper triangle only, so the mirrored lower
+triangle shows the same signal unobstructed; a well-supported call sits on off-diagonal colocation signal.
+By default only PASS calls are marked (`--sv-all` adds the rest, faded). Intra-chromosomal calls shorter
+than two plot bins are also left out, because they sit on the diagonal. INS records and single breakends
+have no second position and are skipped. The script prints which calls were marked and why the others
+were hidden.
+
 The script reads the cooler HDF5 schema (v2/v3) directly with `h5py`, so the `cooler` package is not
 needed. It takes single-resolution `.cool`/`.cooler` files and multi-resolution `.mcool`/`.mcooler`
 files, plus URIs such as `sample.mcool::/resolutions/2000`. File bins are summed into plot bins sized to
@@ -131,6 +140,7 @@ python3 plot_colocation.py sample.colocation.cooler --region chr5:60,000,000-80,
 python3 plot_colocation.py sample.colocation.cooler --region chrX:150,000,000-156,000,000 \
     --triangle --depth 2e6
 python3 plot_colocation.py sample.colocation.cooler --region chr9 --region chr22 -o chr9_chr22.png
+python3 plot_colocation.py sample.colocation.cooler --sv-vcf sample.sv.vcf.gz             # mark SV calls
 python3 plot_colocation.py sample.colocation.cooler --info                  # bin size, contigs, nnz
 ```
 
@@ -152,6 +162,10 @@ python3 plot_colocation.py sample.colocation.mcool
 | `--binsize` | plot bin size in bp (a multiple of the file's bin size); default chosen from `--max-bins` |
 | `--max-bins` | automatic bin size keeps the view at most this many bins across (default 1500) |
 | `--triangle`, `--depth` | single region: rotated upper-triangle view, and the largest distance shown (bp) |
+| `--sv-vcf` | DRAGEN SV VCF (`.vcf` or `.vcf.gz`) whose calls are marked on the map |
+| `--sv-all` | also mark non-PASS calls (faded) |
+| `--sv-types` | SV types to mark (default `DEL,DUP,INV,BND`) |
+| `--sv-min-length` | hide intra-chromosomal calls shorter than this (bp; default two plot bins) |
 | `--balance` | use `bins/weight` from `cooler balance` instead of raw counts |
 | `--linear`, `--vmin`, `--vmax` | colour scale (default log, smallest to largest non-zero value) |
 | `--cmap` | `fall` (default) or any matplotlib colormap |
