@@ -62,6 +62,67 @@ annotates them on the figure.
 - [`samtools`](https://www.htslib.org/) on `PATH`
 - Python 3 with `numpy`, `matplotlib`, `scikit-learn`
 
+## `plot_virtual_fish.py`
+
+**Virtual FISH**: each read pair is coloured by the chromosome or region it maps to and drawn at the
+nanowell it was sequenced in. The result is a chromosome-paint picture of a flow-cell lane. On TruPath data
+a paint shows up as single-coloured spots, and each spot is the constellation of one long DNA molecule.
+
+One figure, three zoom levels:
+
+- **lane**: every tile of one lane, placed by tile name (surface, swath, tile; `1205` = surface 1, swath 2,
+  tile 05). Colour is the mix of paints and intensity is read density;
+- **tile**: one tile at full density;
+- **window**: a few thousand read-name units of that tile, one dot per read pair. Reads with the same paint
+  that are close on the flow cell (`--link-radius`) and in the genome (`--link-gap`) are joined into
+  constellations and labelled.
+
+With two or more paints, constellations of different paints that share one footprint are counted across
+the lane. Such a pair is one molecule carrying both paints, e.g. a BCR-ABL1 fusion, so this is the virtual
+version of a dual-fusion FISH probe. A control that shifts one paint to other tiles gives the count expected
+by chance.
+
+### Usage
+
+```bash
+# one chromosome
+python3 plot_virtual_fish.py --input sample.cram --reference genome.fa --paint chr7
+
+# two regions, with a fusion count
+python3 plot_virtual_fish.py --input sample.cram --reference genome.fa \
+  --paint BCR=chr22:23,180,000-23,320,000 --paint ABL1=chr9:130,713,000-130,887,000
+
+# every chromosome, lane 2, zoomed into tile 1205
+python3 plot_virtual_fish.py --input sample.cram --reference genome.fa --lane 2 --tile 1205
+```
+
+Painting chromosomes or regions reads only those parts of the file through the index. Painting every
+chromosome (no `--paint`) reads the whole file at roughly 0.4 million read pairs per second, so a 30x
+genome takes about 15–20 minutes; `--subsample 0.1` gives a quick look. When a lane has more reads than
+`--max-points`, the lane overview is drawn from a uniform sample. The zoom tile always keeps every read.
+Read pairs are counted once (read 1); secondary, supplementary, QC-fail and duplicate records are
+skipped.
+
+### Options
+
+| option | meaning |
+|--------|---------|
+| `--paint` | `chrom`, `chrom:start-end` or `LABEL=chrom:start-end`; repeat for up to 8 paints. Default: chr1–22, X, Y |
+| `--lane` | lane number or `FLOWCELL:LANE` (default: the first lane in the file) |
+| `--tile`, `--window X,Y`, `--window-size` | zoom tile and window centre/width (default: the densest spot; 3000 units) |
+| `--link-radius`, `--link-gap`, `--min-constellation` | constellation linking: flow-cell distance (350), genomic distance (500 kb), minimum reads to label (4) |
+| `--mapq`, `--keep-duplicates` | read filters (default MAPQ ≥ 20, duplicates dropped) |
+| `--max-points` | reads kept for the lane overview before it switches to a uniform sample (default 4,000,000) |
+| `--subsample` | fraction of reads passed through samtools, for a quick look (also thins the zoom) |
+| `-o/--out`, `--title`, `--dpi`, `--threads` | output (`.png`/`.pdf`/`.svg`), title, resolution, samtools threads |
+
+Tiles are placed by name only. The script does not work out which end of the lane is the inlet.
+
+### Requirements
+
+- [`samtools`](https://www.htslib.org/) on `PATH`
+- Python 3 with `numpy`, `matplotlib`
+
 ## `plot_vaf.py`
 
 Plots the **variant allele frequency (VAF) distribution** of a VCF/BCF as a histogram — green for
