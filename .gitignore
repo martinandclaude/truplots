@@ -1,0 +1,30 @@
+# Never commit sequencing data or results to this repo.
+# Code only.
+*.cram
+*.crai
+*.bam
+*.bai
+*.sam
+*.vcf
+*.vcf.gz
+*.gvcf
+*.gvcf.gz
+*.tbi
+*.csv
+*.tsv
+*.bed
+*.bed.gz
+*.fa
+*.fasta
+*.fa.gz
+*.fai
+*.png
+*.pdf
+*.svg
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store

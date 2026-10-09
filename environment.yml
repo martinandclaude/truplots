@@ -1,0 +1,15 @@
+name: trupath-qc
+channels:
+  - conda-forge
+  - bioconda
+  - nodefaults
+dependencies:
+  # python libraries used by the plotting tools
+  - python=3.11
+  - numpy
+  - matplotlib-base
+  - scikit-learn          # DBSCAN clustering in plot_molecule.py
+  - pysam                 # VCF reading in plot_vaf.py
+  # command-line tools: CRAM/BAM access + panel building
+  - samtools=1.21         # plot_molecule.py
+  - htslib=1.21           # provides bgzip + tabix
