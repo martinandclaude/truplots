@@ -94,3 +94,84 @@ python3 plot_vaf.py sample.vcf.gz -s TUMOR --min-dp 20 --pass-only --bins 80
 ### Requirements
 
 - Python 3 with [`pysam`](https://pysam.readthedocs.io/), `numpy`, `matplotlib`
+
+## `plot_colocation.py`
+
+Plots DRAGEN TruPath **colocation maps** (`<sample>.colocation.cooler`) as heatmaps. DRAGEN splits the
+genome into fixed bins (default ~2 kb, `--colocation-bin-size`) and counts, for every pair of bins, how
+many reads from the two bins sat close together on the flow cell. Most signal sits on the diagonal
+(fragments of the same long template molecule). Off-diagonal structure can point to structural
+variants:
+
+- **deletion** — a gap in the diagonal (only dimmer if heterozygous), with a triangle of signal joining the two flanks;
+- **inversion** — a bow-tie / hourglass between the two breakpoints;
+- **translocation** — a spot in the off-diagonal block between two chromosomes (or two distant regions).
+
+Three views:
+
+- **genome-wide** (no `--region`): chr1–22, X, Y, with chromosome boundaries and the intra-chromosomal
+  share of counts;
+- **one region**: a square heatmap, or `--triangle` for the rotated upper triangle (HiGlass
+  horizontal-heatmap style; `--depth` caps the distance shown);
+- **several regions** (`--region` repeated): the regions are placed side by side on both axes, so the
+  off-diagonal blocks show signal between them.
+
+**SV call overlay** (`--sv-vcf sample.sv.vcf.gz`): DRAGEN SV calls are marked at their breakpoint
+pairs: DEL, DUP and INV at (POS, END), and BND at (POS, mate position), with each mate pair drawn once.
+Each type gets its own colour and marker shape. Calls go in the upper triangle only, so the mirrored lower
+triangle shows the same signal unobstructed; a well-supported call sits on off-diagonal colocation signal.
+By default only PASS calls are marked (`--sv-all` adds the rest, faded). Intra-chromosomal calls shorter
+than two plot bins are also left out, because they sit on the diagonal. INS records and single breakends
+have no second position and are skipped. The script prints which calls were marked and why the others
+were hidden.
+
+The script reads the cooler HDF5 schema (v2/v3) directly with `h5py`, so the `cooler` package is not
+needed. It takes single-resolution `.cool`/`.cooler` files and multi-resolution `.mcool`/`.mcooler`
+files, plus URIs such as `sample.mcool::/resolutions/2000`. File bins are summed into plot bins sized to
+the view (`--max-bins`, default 1500 across), so the whole genome can be drawn from 2 kb data. The
+default colour scale is log, with HiGlass's `fall` colormap so plots look like the HiGlass view; empty
+bin pairs are white.
+
+### Usage
+
+```bash
+python3 plot_colocation.py sample.colocation.cooler                         # genome-wide
+python3 plot_colocation.py sample.colocation.cooler --region chr5:60,000,000-80,000,000
+python3 plot_colocation.py sample.colocation.cooler --region chrX:150,000,000-156,000,000 \
+    --triangle --depth 2e6
+python3 plot_colocation.py sample.colocation.cooler --region chr9 --region chr22 -o chr9_chr22.png
+python3 plot_colocation.py sample.colocation.cooler --sv-vcf sample.sv.vcf.gz             # mark SV calls
+python3 plot_colocation.py sample.colocation.cooler --info                  # bin size, contigs, nnz
+```
+
+A genome-wide plot from the 2 kb file has to decompress every pixel, which can take a few minutes on
+a full-coverage sample. To make repeated plotting fast, zoomify the file once. The script then reads
+the coarsest zoom level that fits each view:
+
+```bash
+cooler zoomify sample.colocation.cooler -o sample.colocation.mcool
+python3 plot_colocation.py sample.colocation.mcool
+```
+
+### Options
+
+| option | meaning |
+|--------|---------|
+| `-r, --region` | `chrom` or `chrom:start-end` (1-based, inclusive); repeat to place regions side by side. Default: genome-wide |
+| `--all-contigs` | genome-wide: also include alt/decoy/unplaced contigs and chrM |
+| `--binsize` | plot bin size in bp (a multiple of the file's bin size); default chosen from `--max-bins` |
+| `--max-bins` | automatic bin size keeps the view at most this many bins across (default 1500) |
+| `--triangle`, `--depth` | single region: rotated upper-triangle view, and the largest distance shown (bp) |
+| `--sv-vcf` | DRAGEN SV VCF (`.vcf` or `.vcf.gz`) whose calls are marked on the map |
+| `--sv-all` | also mark non-PASS calls (faded) |
+| `--sv-types` | SV types to mark (default `DEL,DUP,INV,BND`) |
+| `--sv-min-length` | hide intra-chromosomal calls shorter than this (bp; default two plot bins) |
+| `--balance` | use `bins/weight` from `cooler balance` instead of raw counts |
+| `--linear`, `--vmin`, `--vmax` | colour scale (default log, smallest to largest non-zero value) |
+| `--cmap` | `fall` (default) or any matplotlib colormap |
+| `-o/--out`, `--title`, `--dpi` | output path (`.png`/`.pdf`/`.svg`) / title / resolution |
+| `--chunksize` | pixels read per chunk; lower it to save memory (default 5,000,000) |
+
+### Requirements
+
+- Python 3 with [`h5py`](https://www.h5py.org/), `numpy`, `matplotlib`
