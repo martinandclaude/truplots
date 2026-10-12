@@ -62,6 +62,65 @@ annotates them on the figure.
 - [`samtools`](https://www.htslib.org/) on `PATH`
 - Python 3 with `numpy`, `matplotlib`, `scikit-learn`
 
+## `ont_colocation.py`
+
+Builds a **TruPath-style colocation map from long reads** (ONT, PacBio), so the two technologies can be
+compared directly. A TruPath constellation reconstructs one long DNA molecule; a long read *is* one
+molecule. Each read adds one count to every pair of bins it covers. That includes the bins of its split
+(supplementary) alignments listed in the `SA` tag, which is how amplicon, ecDNA and SV junctions reach
+the off-diagonal. Deletions and skips inside one alignment leave their bins uncovered once they are at
+least one bin long. The output is a cooler v3 file on the same bin grid as DRAGEN's (`--like`), so
+`plot_colocation.py`, `cooler zoomify` / `balance` and HiGlass all read it.
+
+`plot_colocation.py --compare` then draws both maps in one figure: TruPath above the diagonal, the long
+reads below, each on its own adaptive colour scale. The two count different things (read-pair
+colocations vs reads), so they don't share a scale. A junction seen by both technologies shows up as
+mirror-image spots across the diagonal.
+
+### Usage: MYCN amplicon example
+
+```bash
+# 1. long-read map on the TruPath grid; count reads touching the amplicon and its partner segments
+python3 ont_colocation.py --input ont.bam --like sample.colocation.cooler \
+  --region chr2:13,000,000-18,000,000 --region chr12:67,000,000-69,000,000 -o ont.colocation.cool
+
+# 2. split view of the MYCN region
+python3 plot_colocation.py sample.colocation.cooler --compare ont.colocation.cool \
+  --names TruPath,ONT --region chr2:15,500,000-16,300,000
+
+# 3. co-amplified segments side by side: the blocks between them are the amplicon junctions
+python3 plot_colocation.py sample.colocation.cooler --compare ont.colocation.cool --names TruPath,ONT \
+  --region chr2:14,100,000-14,500,000 --region chr2:15,600,000-16,200,000 --region chr12:67,900,000-68,250,000
+```
+
+With `--region`, only reads that have an alignment in those regions are counted, but all of each read's
+segments are counted wherever they map. Give every amplicon segment its own `--region` so that reads
+lying entirely inside a partner segment are counted too. Without `--region` every read is counted; use a
+coarser `--binsize` for a whole genome.
+
+Tips for highly amplified loci:
+
+- the colour scale adapts to the amplicon (often 50–100 copies), so the non-amplified background drops
+  below the white threshold; add `--dynamic-range 1000` to `plot_colocation.py` to show it as well;
+- both maps must come from the same reference build; `--compare` stops if a contig's length differs;
+- run `cooler balance` on both files and add `--balance` to compare linkage with copy number
+  normalised away.
+
+### Options
+
+| option | meaning |
+|--------|---------|
+| `--input`, `--reference` | indexed long-read BAM/CRAM (e.g. minimap2, with `SA` tags), and the FASTA for CRAM |
+| `--like` | TruPath cooler or `.mcool` whose bin size to copy; warns if contig lengths differ |
+| `--binsize` | bin size in bp (default 2000, or that of `--like`) |
+| `-r, --region` | count reads with an alignment here; repeatable (default: every read) |
+| `--mapq`, `--min-length` | minimum MAPQ per alignment segment (default 20); minimum read length |
+| `-o/--out`, `--assembly`, `--threads` | output cooler, assembly label, decompression threads |
+
+### Requirements
+
+- Python 3 with [`pysam`](https://pysam.readthedocs.io/), `numpy`, `h5py`
+
 ## `plot_virtual_fish.py`
 
 **Virtual FISH**: each read pair is coloured by the chromosome or region it maps to and drawn at the
@@ -189,9 +248,16 @@ were hidden.
 The script reads the cooler HDF5 schema (v2/v3) directly with `h5py`, so the `cooler` package is not
 needed. It takes single-resolution `.cool`/`.cooler` files and multi-resolution `.mcool`/`.mcooler`
 files, plus URIs such as `sample.mcool::/resolutions/2000`. File bins are summed into plot bins sized to
-the view (`--max-bins`, default 1500 across), so the whole genome can be drawn from 2 kb data. The
-default colour scale is log, with HiGlass's `fall` colormap so plots look like the HiGlass view; empty
-bin pairs are white.
+the view (`--max-bins`, default 1000 across), so the whole genome can be drawn from 2 kb data.
+
+**Colour scale.** The scale adapts to each view, as in Illumina's HiGlass colocation figures. It is log,
+uses HiGlass's `fall` colormap and is labelled 20, 30, 50, 70, 100 and so on. The top sits at the
+near-diagonal band: the 99.9th percentile of off-diagonal values, so the diagonal itself saturates to
+black and a few extreme bins can't stretch the scale. The bottom is 30× lower (`--dynamic-range`), and
+anything below it is drawn white. Sparse background counts therefore disappear, and only the molecule
+band and SV signal are coloured. On a 2 kb region view this gives ranges like Illumina's
+(≈15–400 counts). At coarse genome-wide bins, SV junction pixels still land well inside the range. The
+range used is printed in the plot caption. Set `--vmin`/`--vmax` to put several samples on one scale.
 
 ### Usage
 
@@ -202,6 +268,8 @@ python3 plot_colocation.py sample.colocation.cooler --region chrX:150,000,000-15
     --triangle --depth 2e6
 python3 plot_colocation.py sample.colocation.cooler --region chr9 --region chr22 -o chr9_chr22.png
 python3 plot_colocation.py sample.colocation.cooler --sv-vcf sample.sv.vcf.gz             # mark SV calls
+python3 plot_colocation.py sample.colocation.cooler --compare ont.colocation.cool \
+    --names TruPath,ONT --region chr2:15,500,000-16,300,000                            # see below
 python3 plot_colocation.py sample.colocation.cooler --info                  # bin size, contigs, nnz
 ```
 
@@ -221,14 +289,16 @@ python3 plot_colocation.py sample.colocation.mcool
 | `-r, --region` | `chrom` or `chrom:start-end` (1-based, inclusive); repeat to place regions side by side. Default: genome-wide |
 | `--all-contigs` | genome-wide: also include alt/decoy/unplaced contigs and chrM |
 | `--binsize` | plot bin size in bp (a multiple of the file's bin size); default chosen from `--max-bins` |
-| `--max-bins` | automatic bin size keeps the view at most this many bins across (default 1500) |
+| `--max-bins` | automatic bin size keeps the view at most this many bins across (default 1000, so each bin gets at least one pixel) |
 | `--triangle`, `--depth` | single region: rotated upper-triangle view, and the largest distance shown (bp) |
 | `--sv-vcf` | DRAGEN SV VCF (`.vcf` or `.vcf.gz`) whose calls are marked on the map |
 | `--sv-all` | also mark non-PASS calls (faded) |
 | `--sv-types` | SV types to mark (default `DEL,DUP,INV,BND`) |
 | `--sv-min-length` | hide intra-chromosomal calls shorter than this (bp; default two plot bins) |
+| `--compare`, `--names` | second map drawn below the diagonal on its own colour scale (see `ont_colocation.py`), and the two maps' names |
 | `--balance` | use `bins/weight` from `cooler balance` instead of raw counts |
-| `--linear`, `--vmin`, `--vmax` | colour scale (default log, smallest to largest non-zero value) |
+| `--vmax`, `--vmin`, `--dynamic-range` | colour scale limits (default: 99.9th percentile of off-diagonal values, and that ÷ 30); values below the minimum are white |
+| `--linear` | linear instead of log colour scale (minimum 0) |
 | `--cmap` | `fall` (default) or any matplotlib colormap |
 | `-o/--out`, `--title`, `--dpi` | output path (`.png`/`.pdf`/`.svg`) / title / resolution |
 | `--chunksize` | pixels read per chunk; lower it to save memory (default 5,000,000) |
