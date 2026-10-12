@@ -189,9 +189,16 @@ were hidden.
 The script reads the cooler HDF5 schema (v2/v3) directly with `h5py`, so the `cooler` package is not
 needed. It takes single-resolution `.cool`/`.cooler` files and multi-resolution `.mcool`/`.mcooler`
 files, plus URIs such as `sample.mcool::/resolutions/2000`. File bins are summed into plot bins sized to
-the view (`--max-bins`, default 1500 across), so the whole genome can be drawn from 2 kb data. The
-default colour scale is log, with HiGlass's `fall` colormap so plots look like the HiGlass view; empty
-bin pairs are white.
+the view (`--max-bins`, default 1000 across), so the whole genome can be drawn from 2 kb data.
+
+**Colour scale.** The scale adapts to each view, as in Illumina's HiGlass colocation figures. It is log,
+uses HiGlass's `fall` colormap and is labelled 20, 30, 50, 70, 100 and so on. The top sits at the
+near-diagonal band: the 99.9th percentile of off-diagonal values, so the diagonal itself saturates to
+black and a few extreme bins can't stretch the scale. The bottom is 30× lower (`--dynamic-range`), and
+anything below it is drawn white. Sparse background counts therefore disappear, and only the molecule
+band and SV signal are coloured. On a 2 kb region view this gives ranges like Illumina's
+(≈15–400 counts). At coarse genome-wide bins, SV junction pixels still land well inside the range. The
+range used is printed in the plot caption. Set `--vmin`/`--vmax` to put several samples on one scale.
 
 ### Usage
 
@@ -221,14 +228,15 @@ python3 plot_colocation.py sample.colocation.mcool
 | `-r, --region` | `chrom` or `chrom:start-end` (1-based, inclusive); repeat to place regions side by side. Default: genome-wide |
 | `--all-contigs` | genome-wide: also include alt/decoy/unplaced contigs and chrM |
 | `--binsize` | plot bin size in bp (a multiple of the file's bin size); default chosen from `--max-bins` |
-| `--max-bins` | automatic bin size keeps the view at most this many bins across (default 1500) |
+| `--max-bins` | automatic bin size keeps the view at most this many bins across (default 1000, so each bin gets at least one pixel) |
 | `--triangle`, `--depth` | single region: rotated upper-triangle view, and the largest distance shown (bp) |
 | `--sv-vcf` | DRAGEN SV VCF (`.vcf` or `.vcf.gz`) whose calls are marked on the map |
 | `--sv-all` | also mark non-PASS calls (faded) |
 | `--sv-types` | SV types to mark (default `DEL,DUP,INV,BND`) |
 | `--sv-min-length` | hide intra-chromosomal calls shorter than this (bp; default two plot bins) |
 | `--balance` | use `bins/weight` from `cooler balance` instead of raw counts |
-| `--linear`, `--vmin`, `--vmax` | colour scale (default log, smallest to largest non-zero value) |
+| `--vmax`, `--vmin`, `--dynamic-range` | colour scale limits (default: 99.9th percentile of off-diagonal values, and that ÷ 30); values below the minimum are white |
+| `--linear` | linear instead of log colour scale (minimum 0) |
 | `--cmap` | `fall` (default) or any matplotlib colormap |
 | `-o/--out`, `--title`, `--dpi` | output path (`.png`/`.pdf`/`.svg`) / title / resolution |
 | `--chunksize` | pixels read per chunk; lower it to save memory (default 5,000,000) |

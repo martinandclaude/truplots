@@ -26,6 +26,10 @@ schema v2/v3, read directly with h5py), e.g. after `cooler zoomify`. File bins a
 into larger plot bins (cooler's coarsen convention), so very large views stay cheap. Raw
 counts by default; --balance applies bins/weight if present (from `cooler balance`).
 
+The colour scale adapts to each view, as in Illumina's HiGlass colocation figures: the top sits at
+the near-diagonal band (99.9th percentile of off-diagonal values, so the diagonal saturates) and the
+log scale spans --dynamic-range (default 30x) below it, so sparse background counts stay white.
+
 Examples:
   plot_colocation.py sample.colocation.cooler
   plot_colocation.py sample.colocation.cooler --region chr5:60,000,000-80,000,000
@@ -346,8 +350,9 @@ def draw_svs(ax, placed, triangle):
             if not points:
                 continue
             xs, ys = zip(*points)
-            for edge, width, z in (("white", 3.4, 4), (color, 1.6, 5)):
-                ax.scatter(xs, ys, s=64, marker=marker, facecolors="none", edgecolors=edge,
+            # Large, thin rings: the hollow centre stays clear even over a one-pixel spot.
+            for edge, width, z in (("white", 2.6, 4), (color, 1.4, 5)):
+                ax.scatter(xs, ys, s=150, marker=marker, facecolors="none", edgecolors=edge,
                            linewidths=width, alpha=1 if passed else 0.45, zorder=z)
         if calls:
             handles.append(Line2D([], [], ls="", marker=marker, markersize=7, markerfacecolor="none",
@@ -380,22 +385,38 @@ def print_info(path, h5, res):
         print(f"  metadata: {a['metadata']}")
 
 
+def color_range(m, args):
+    """Default colour limits. Top: the 99.9th percentile of non-zero off-diagonal values, i.e. the
+    near-diagonal band, so the diagonal itself saturates and a few extreme bins do not set the scale.
+    Bottom: on a log scale --dynamic-range below the top (values under it are drawn white); on a
+    linear scale zero."""
+    positive = m[m > 0]
+    if not positive.size:
+        raise InputError("No colocation counts in the selected view.")
+    off = m[~np.eye(len(m), dtype=bool)]
+    off = off[off > 0]
+    vmax = args.vmax if args.vmax is not None else float(np.quantile(off if off.size else positive, 0.999))
+    if args.vmin is not None:
+        vmin = args.vmin
+    else:
+        vmin = 0.0 if args.linear else vmax / args.dynamic_range
+    if not vmin < vmax:
+        raise InputError(f"Colour scale minimum {vmin:g} is not below the maximum {vmax:g}; adjust --vmin/--vmax.")
+    return vmin, vmax
+
+
 def plot(m, segments, binsize, file_res, args, total, within, out, genome, placed=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize
-    from matplotlib.ticker import FuncFormatter
+    from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
     plt.rcParams.update({"font.family": "DejaVu Sans", "axes.spines.top": False,
                          "axes.spines.right": False, "svg.fonttype": "none"})
     cmap = (LinearSegmentedColormap.from_list("fall", FALL) if args.cmap == "fall"
-            else matplotlib.colormaps[args.cmap]).with_extremes(bad="white")
-    positive = m[m > 0]
-    if not positive.size:
-        raise InputError("No colocation counts in the selected view.")
-    vmin = args.vmin if args.vmin is not None else positive.min()
-    vmax = args.vmax if args.vmax is not None else positive.max()
+            else matplotlib.colormaps[args.cmap]).with_extremes(bad="white", under="white")
+    vmin, vmax = color_range(m, args)
     norm = Normalize(vmin, vmax) if args.linear else LogNorm(vmin, vmax)
     shown = np.ma.masked_less_equal(m, 0)        # empty bin pairs stay white
 
@@ -404,7 +425,7 @@ def plot(m, segments, binsize, file_res, args, total, within, out, genome, place
     title = args.title or f"Colocation map · {name}"
     caption = (f"{view} · {fmt_bp(binsize)} bins (file {fmt_bp(file_res)}) · "
                f"{'balanced' if args.balance else 'raw counts'}, "
-               f"{'linear' if args.linear else 'log'} scale")
+               f"{'linear' if args.linear else 'log'} scale {vmin:.3g}–{vmax:.3g}")
     if len(segments) > 1:
         caption += f" · {within / total:.1%} {'intra-chromosomal' if genome else 'within regions'}"
 
@@ -461,6 +482,10 @@ def plot(m, segments, binsize, file_res, args, total, within, out, genome, place
     # An inset colorbar follows the axes box, which aspect="equal" shrinks in the triangle view.
     bar = fig.colorbar(mappable, cax=ax.inset_axes([1.02 if args.triangle else 1.04, 0, 0.018, 1]))
     bar.set_label("balanced colocation" if args.balance else "colocation count", fontsize=9)
+    if not args.linear:                              # label 20, 30, 50, 70, 100, ... as Illumina does
+        bar.ax.yaxis.set_major_locator(LogLocator(subs=(1, 2, 3, 5, 7)))
+        bar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+        bar.ax.yaxis.set_minor_formatter(NullFormatter())
     bar.ax.tick_params(labelsize=8)
     bar.outline.set_visible(False)
     ax.tick_params(labelsize=7 if genome else 8)
@@ -508,8 +533,9 @@ def parse_args(argv=None):
                         "(default: chr1-22, X, Y).")
     p.add_argument("--binsize", type=int,
                    help="Plot bin size in bp, a multiple of the file's bin size. Default: chosen from --max-bins.")
-    p.add_argument("--max-bins", type=int, default=1500,
-                   help="Automatic bin size keeps the view at most this many bins across (default 1500).")
+    p.add_argument("--max-bins", type=int, default=1000,
+                   help="Automatic bin size keeps the view at most this many bins across (default 1000, so every "
+                        "bin gets at least one pixel at the default --dpi and a single-bin SV spot is never dropped).")
     p.add_argument("--triangle", action="store_true",
                    help="One region only: draw the upper triangle rotated 45 degrees, like a HiGlass horizontal heatmap.")
     p.add_argument("--depth", type=float,
@@ -523,8 +549,12 @@ def parse_args(argv=None):
                         "(default: two plot bins).")
     p.add_argument("--balance", action="store_true", help="Use bins/weight (`cooler balance`) instead of raw counts.")
     p.add_argument("--linear", action="store_true", help="Linear colour scale (default: log).")
-    p.add_argument("--vmin", type=float, help="Colour scale minimum (default: smallest non-zero value).")
-    p.add_argument("--vmax", type=float, help="Colour scale maximum (default: largest value).")
+    p.add_argument("--vmax", type=float,
+                   help="Colour scale maximum (default: 99.9th percentile of off-diagonal values; the diagonal saturates).")
+    p.add_argument("--vmin", type=float,
+                   help="Colour scale minimum; values below it are white (default: --vmax / --dynamic-range).")
+    p.add_argument("--dynamic-range", type=float, default=30,
+                   help="Log scale: how many times smaller the minimum is than the maximum (default 30).")
     p.add_argument("--cmap", default="fall", help="'fall' (HiGlass default) or any matplotlib colormap name.")
     p.add_argument("-o", "--out", help="Output image; format from the extension (.png/.pdf/.svg). "
                                        "Default: <cooler name>.<view>.png")
@@ -547,6 +577,8 @@ def parse_args(argv=None):
         p.error("--sv-all and --sv-min-length are used with --sv-vcf.")
     if args.sv_min_length is not None and args.sv_min_length < 0:
         p.error("--sv-min-length must be zero or positive.")
+    if not args.dynamic_range > 1:
+        p.error("--dynamic-range must be greater than 1.")
     if not args.linear and args.vmin is not None and args.vmin <= 0:
         p.error("--vmin must be positive on a log scale (or add --linear).")
     if args.cmap != "fall":
