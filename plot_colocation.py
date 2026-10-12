@@ -30,23 +30,30 @@ The colour scale adapts to each view, as in Illumina's HiGlass colocation figure
 the near-diagonal band (99.9th percentile of off-diagonal values, so the diagonal saturates) and the
 log scale spans --dynamic-range (default 30x) below it, so sparse background counts stay white.
 
+--compare puts a second map on the same grid: the main file above the diagonal, the second below
+it, each with its own colour scale. Use it to set a long-read map (ont_colocation.py) against TruPath;
+a junction seen by both technologies shows as mirror-image spots across the diagonal.
+
 Examples:
   plot_colocation.py sample.colocation.cooler
   plot_colocation.py sample.colocation.cooler --region chr5:60,000,000-80,000,000
   plot_colocation.py sample.colocation.cooler --region chrX:150,000,000-156,000,000 --triangle --depth 2e6
   plot_colocation.py sample.colocation.mcool --region chr9 --region chr22 -o chr9_chr22.png
   plot_colocation.py sample.colocation.mcool --sv-vcf sample.sv.vcf.gz
+  plot_colocation.py sample.colocation.cooler --compare ont.colocation.cool --names TruPath,ONT --region chr2:15,500,000-16,300,000
   plot_colocation.py sample.colocation.cooler --info
 
 Requires: Python 3 with numpy, h5py, matplotlib.
 """
 import argparse
 import collections
+import contextlib
 import dataclasses
 import gzip
 import math
 import re
 import sys
+import textwrap
 from pathlib import Path
 
 import numpy as np
@@ -199,7 +206,9 @@ def layout(clr, segments, factor):
     for seg in segments:
         c = clr.chroms.index(seg.chrom)
         off = int(clr.chrom_offset[c])
-        seg.lo = off + seg.start // clr.binsize
+        # Plot bins sit on a fixed genomic grid (multiples of the plot bin size), so two files with
+        # different file bin sizes line up bin for bin.
+        seg.lo = off + seg.start // (factor * clr.binsize) * factor
         seg.hi = off + -(-seg.end // clr.binsize)
         seg.x0 = (seg.lo - off) * clr.binsize
         if (fmap[seg.lo:seg.hi] >= 0).any():
@@ -385,30 +394,31 @@ def print_info(path, h5, res):
         print(f"  metadata: {a['metadata']}")
 
 
-def color_range(m, args):
+def color_range(m, args, vmin=None, vmax=None, what="the selected view"):
     """Default colour limits. Top: the 99.9th percentile of non-zero off-diagonal values, i.e. the
     near-diagonal band, so the diagonal itself saturates and a few extreme bins do not set the scale.
     Bottom: on a log scale --dynamic-range below the top (values under it are drawn white); on a
-    linear scale zero."""
+    linear scale zero. vmin/vmax override either end."""
     positive = m[m > 0]
     if not positive.size:
-        raise InputError("No colocation counts in the selected view.")
+        raise InputError(f"No colocation counts in {what}.")
     off = m[~np.eye(len(m), dtype=bool)]
     off = off[off > 0]
-    vmax = args.vmax if args.vmax is not None else float(np.quantile(off if off.size else positive, 0.999))
-    if args.vmin is not None:
-        vmin = args.vmin
-    else:
+    if vmax is None:
+        vmax = float(np.quantile(off if off.size else positive, 0.999))
+    if vmin is None:
         vmin = 0.0 if args.linear else vmax / args.dynamic_range
     if not vmin < vmax:
         raise InputError(f"Colour scale minimum {vmin:g} is not below the maximum {vmax:g}; adjust --vmin/--vmax.")
     return vmin, vmax
 
 
-def plot(m, segments, binsize, file_res, args, total, within, out, genome, placed=None):
+def plot(m, segments, binsize, file_res, args, total, within, out, genome, placed=None, other=None):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    import matplotlib.patheffects as effects
+    from matplotlib.cm import ScalarMappable
     from matplotlib.colors import LinearSegmentedColormap, LogNorm, Normalize
     from matplotlib.ticker import FuncFormatter, LogLocator, NullFormatter
 
@@ -416,18 +426,38 @@ def plot(m, segments, binsize, file_res, args, total, within, out, genome, place
                          "axes.spines.right": False, "svg.fonttype": "none"})
     cmap = (LinearSegmentedColormap.from_list("fall", FALL) if args.cmap == "fall"
             else matplotlib.colormaps[args.cmap]).with_extremes(bad="white", under="white")
-    vmin, vmax = color_range(m, args)
+    vmin, vmax = color_range(m, args, args.vmin, args.vmax)
     norm = Normalize(vmin, vmax) if args.linear else LogNorm(vmin, vmax)
     shown = np.ma.masked_less_equal(m, 0)        # empty bin pairs stay white
+    image, draw = shown, dict(cmap=cmap, norm=norm)
+    scale = "linear" if args.linear else "log"
+    if other is not None:
+        # Split view: main file on and above the diagonal, the second file below it, each on its
+        # own adaptive scale (the two technologies count different things).
+        names = other["names"]
+        vmin_b, vmax_b = color_range(other["m"], args, what=f"{names[1]} for this view")
+        norm_b = Normalize(vmin_b, vmax_b) if args.linear else LogNorm(vmin_b, vmax_b)
+        upper = np.triu(np.ones(m.shape, dtype=bool))[..., None]
+        image = np.where(upper, cmap(norm(shown)), cmap(norm_b(np.ma.masked_less_equal(other["m"], 0))))
+        draw = {}
 
     name = Path(split_uri(args.cooler)[0]).name
     view = ("genome-wide" if genome else " + ".join(s.label for s in segments))
-    title = args.title or f"Colocation map · {name}"
-    caption = (f"{view} · {fmt_bp(binsize)} bins (file {fmt_bp(file_res)}) · "
-               f"{'balanced' if args.balance else 'raw counts'}, "
-               f"{'linear' if args.linear else 'log'} scale {vmin:.3g}–{vmax:.3g}")
+    kind = "balanced" if args.balance else "raw counts"
+    if other is None:
+        title = args.title or f"Colocation map · {name}"
+        caption = (f"{view} · {fmt_bp(binsize)} bins (file {fmt_bp(file_res)}) · {kind}, "
+                   f"{scale} scale {vmin:.3g}–{vmax:.3g}")
+    else:
+        title = args.title or f"Colocation maps · {names[0]} vs {names[1]}"
+        caption = f"{view} · {fmt_bp(binsize)} bins · {kind}"
     if len(segments) > 1:
         caption += f" · {within / total:.1%} {'intra-chromosomal' if genome else 'within regions'}"
+    if other is not None:
+        caption += (f"\nupper: {names[0]}, {scale} {vmin:.3g}–{vmax:.3g} · "
+                    f"lower: {names[1]}, {scale} {vmin_b:.3g}–{vmax_b:.3g}")
+    # Wrap so a long caption cannot widen the figure past the plot.
+    caption = "\n".join(textwrap.fill(line, 105) for line in caption.split("\n"))
 
     seg = segments[0]
     span = seg.end - seg.start
@@ -455,7 +485,7 @@ def plot(m, segments, binsize, file_res, args, total, within, out, genome, place
     else:
         fig, ax = plt.subplots(figsize=(8.6, 7.6))
         if len(segments) == 1:
-            mappable = ax.imshow(shown, cmap=cmap, norm=norm, interpolation="nearest",
+            mappable = ax.imshow(image, interpolation="nearest", **draw,
                                  extent=(x0, x0 + seg.n * binsize, x0 + seg.n * binsize, x0))
             ax.set_xlim(x0, x1)
             ax.set_ylim(x1, x0)
@@ -464,7 +494,7 @@ def plot(m, segments, binsize, file_res, args, total, within, out, genome, place
             ax.set_xlabel(f"{seg.chrom} position ({unit_name})")
             ax.set_ylabel(f"{seg.chrom} position ({unit_name})")
         else:
-            mappable = ax.imshow(shown, cmap=cmap, norm=norm, interpolation="nearest")
+            mappable = ax.imshow(image, interpolation="nearest", **draw)
             n = m.shape[0]
             for s in segments[1:]:
                 for line in (ax.axhline, ax.axvline):
@@ -479,19 +509,32 @@ def plot(m, segments, binsize, file_res, args, total, within, out, genome, place
             if not genome:
                 plt.setp(ax.get_yticklabels(), rotation=90, va="center")
         ax.spines[["top", "right"]].set_visible(True)
-    # An inset colorbar follows the axes box, which aspect="equal" shrinks in the triangle view.
-    bar = fig.colorbar(mappable, cax=ax.inset_axes([1.02 if args.triangle else 1.04, 0, 0.018, 1]))
-    bar.set_label("balanced colocation" if args.balance else "colocation count", fontsize=9)
-    if not args.linear:                              # label 20, 30, 50, 70, 100, ... as Illumina does
-        bar.ax.yaxis.set_major_locator(LogLocator(subs=(1, 2, 3, 5, 7)))
-        bar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-        bar.ax.yaxis.set_minor_formatter(NullFormatter())
-    bar.ax.tick_params(labelsize=8)
-    bar.outline.set_visible(False)
+    # Inset colorbars follow the axes box, which aspect="equal" shrinks in the triangle view. In the
+    # split view the top half belongs to the upper triangle and the bottom half to the lower one.
+    left = 1.02 if args.triangle else 1.04
+    label = "balanced colocation" if args.balance else "colocation count"
+    bars = [(mappable, [left, 0, 0.018, 1], label)] if other is None else [
+        (ScalarMappable(norm, cmap), [left, 0.53, 0.018, 0.47], f"{names[0]} (upper)"),
+        (ScalarMappable(norm_b, cmap), [left, 0, 0.018, 0.47], f"{names[1]} (lower)")]
+    for source, rect, text in bars:
+        bar = fig.colorbar(source, cax=ax.inset_axes(rect))
+        bar.set_label(text, fontsize=9)
+        if not args.linear:                          # label 20, 30, 50, 70, 100, ... as Illumina does
+            bar.ax.yaxis.set_major_locator(LogLocator(subs=(1, 2, 3, 5, 7)))
+            bar.ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+            bar.ax.yaxis.set_minor_formatter(NullFormatter())
+        bar.ax.tick_params(labelsize=8)
+        bar.outline.set_visible(False)
+    if other is not None:
+        for (tx, ty), ha, va, text in (((0.985, 0.985), "right", "top", names[0]),
+                                       ((0.015, 0.015), "left", "bottom", names[1])):
+            corner = ax.text(tx, ty, text, transform=ax.transAxes, ha=ha, va=va, fontsize=10,
+                             fontweight="bold", color="#111827")
+            corner.set_path_effects([effects.withStroke(linewidth=3, foreground="white")])
     ax.tick_params(labelsize=7 if genome else 8)
     ax.xaxis.label.set_fontsize(9)
     ax.yaxis.label.set_fontsize(9)
-    ax.set_title(f"{title}\n", fontsize=12, fontweight="bold", loc="left")
+    ax.set_title(title + "\n" * (caption.count("\n") + 1), fontsize=12, fontweight="bold", loc="left")
     ax.text(0, 1.02, caption, transform=ax.transAxes, fontsize=8.5, color="#4b5563",
             ha="left", va="bottom")
     if placed is not None:
@@ -510,15 +553,44 @@ def plot(m, segments, binsize, file_res, args, total, within, out, genome, place
     plt.close(fig)
 
 
-def default_output(path, segments, genome, triangle):
-    stem = Path(path).name
+def file_stem(path):
+    stem = Path(split_uri(path)[0]).name
     for ext in (".mcooler", ".mcool", ".cooler", ".cool"):
         if stem.endswith(ext):
-            stem = stem[: -len(ext)]
-            break
+            return stem[: -len(ext)]
+    return stem
+
+
+def default_output(path, segments, genome, triangle, compare=None):
+    stem = file_stem(path) + (f".vs.{file_stem(compare).removesuffix('.colocation')}" if compare else "")
     view = "genome" if genome else "__".join(
         re.sub(r"[^\w.-]+", "_", s.label.replace(",", "")).strip("_") for s in segments)
     return f"{stem}.{view}{'.triangle' if triangle else ''}.png"
+
+
+def read_view(h5, res, segments, binsize, args):
+    """Sum one file into plot bins, from its coarsest zoom level that divides the plot bin size."""
+    file_res = max(r for r in res if binsize % r == 0)
+    clr = Cooler(h5, res[file_res])
+    m, total, within = accumulate(clr, segments, binsize // file_res, args.chunksize, args.balance)
+    return file_res, clr, m, total, within
+
+
+def same_grid(segments, a, b, names):
+    """The main file's segments on the second file's contig names. Both maps must share the
+    reference build, so every contig in view must have the same length in both files."""
+    out = []
+    for seg in segments:
+        try:
+            chrom = match_contig(seg.chrom, b.chroms)
+        except InputError:
+            raise InputError(f"Contig {seg.chrom} is not in {names[1]}.") from None
+        la, lb = int(a.lengths[a.chroms.index(seg.chrom)]), int(b.lengths[b.chroms.index(chrom)])
+        if la != lb:
+            raise InputError(f"{seg.chrom} is {la:,} bp in {names[0]} but {lb:,} bp in {names[1]}; "
+                             "both maps need the same reference build.")
+        out.append(dataclasses.replace(seg, chrom=chrom))
+    return out
 
 
 def parse_args(argv=None):
@@ -547,10 +619,14 @@ def parse_args(argv=None):
     p.add_argument("--sv-min-length", type=int,
                    help="Hide intra-chromosomal calls shorter than this, in bp; they sit on the diagonal "
                         "(default: two plot bins).")
+    p.add_argument("--compare", help="Second colocation cooler (e.g. from ont_colocation.py), drawn below the "
+                                     "diagonal on the same grid with its own colour scale.")
+    p.add_argument("--names", help="Names of the main and --compare maps, e.g. TruPath,ONT (default: file names).")
     p.add_argument("--balance", action="store_true", help="Use bins/weight (`cooler balance`) instead of raw counts.")
     p.add_argument("--linear", action="store_true", help="Linear colour scale (default: log).")
     p.add_argument("--vmax", type=float,
-                   help="Colour scale maximum (default: 99.9th percentile of off-diagonal values; the diagonal saturates).")
+                   help="Colour scale maximum (default: 99.9th percentile of off-diagonal values; the diagonal "
+                        "saturates). With --compare it applies to the main map; the second stays adaptive.")
     p.add_argument("--vmin", type=float,
                    help="Colour scale minimum; values below it are white (default: --vmax / --dynamic-range).")
     p.add_argument("--dynamic-range", type=float, default=30,
@@ -566,6 +642,15 @@ def parse_args(argv=None):
     args = p.parse_args(argv)
     if args.triangle and len(args.region) != 1:
         p.error("--triangle needs exactly one --region.")
+    if args.compare and args.triangle:
+        p.error("--compare draws a square split view; it cannot be combined with --triangle.")
+    if args.names and not args.compare:
+        p.error("--names is used with --compare.")
+    if args.compare:
+        names = args.names.split(",") if args.names else [file_stem(args.cooler), file_stem(args.compare)]
+        if len(names) != 2 or not all(n.strip() for n in names):
+            p.error("--names needs two comma-separated names, e.g. --names TruPath,ONT.")
+        args.names = [n.strip() for n in names]
     if args.depth is not None and (not args.triangle or not args.depth > 0):
         p.error("--depth must be positive and is used with --triangle.")
     if any(v is not None and v < 1 for v in (args.binsize, args.max_bins, args.dpi, args.chunksize)):
@@ -625,11 +710,13 @@ def main(argv=None):
     except ImportError:
         sys.exit("error: h5py is required (conda install h5py, or pip install h5py).")
     path, group = split_uri(args.cooler)
+    cpath, cgroup = split_uri(args.compare) if args.compare else (None, None)
     try:
-        for name in (path, args.sv_vcf):
+        for name in (path, args.sv_vcf, cpath):
             if name and not Path(name).is_file():
                 raise InputError(f"File not found: {name}")
-        with h5py.File(path, "r") as h5:
+        with contextlib.ExitStack() as files:
+            h5 = files.enter_context(h5py.File(path, "r"))
             res = find_resolutions(h5, group)
             if args.info:
                 print_info(path, h5, res)
@@ -639,14 +726,26 @@ def main(argv=None):
             segments = (genome_segments(finest, args.all_contigs) if genome
                         else [parse_region(r, finest) for r in args.region])
             span = sum(s.end - s.start for s in segments)
-            binsize = choose_binsize(span, finest.binsize, args.max_bins, args.binsize)
-            # From an .mcool, read the coarsest zoom level that divides the plot bin size.
-            file_res = max(r for r in res if binsize % r == 0)
-            clr = finest if file_res == finest.binsize else Cooler(h5, res[file_res])
-            m, total, within = accumulate(clr, segments, binsize // file_res, args.chunksize, args.balance)
-        out = args.out or default_output(path, segments, genome, args.triangle)
+            base = finest.binsize
+            if args.compare:
+                h5b = files.enter_context(h5py.File(cpath, "r"))
+                res_b = find_resolutions(h5b, cgroup)
+                finest_b = Cooler(h5b, res_b[min(res_b)])
+                base = math.lcm(base, finest_b.binsize)          # plot bins both files divide into
+            binsize = choose_binsize(span, base, args.max_bins, args.binsize)
+            file_res, clr, m, total, within = read_view(h5, res, segments, binsize, args)
+            other = None
+            if args.compare:
+                segments_b = same_grid(segments, finest, finest_b, args.names)
+                file_res_b, clr_b, m_b, total_b, _ = read_view(h5b, res_b, segments_b, binsize, args)
+                other = dict(m=m_b, names=args.names)
+        out = args.out or default_output(path, segments, genome, args.triangle, args.compare)
         print(f"{path}{'::' + clr.group if clr.group != '/' else ''}: "
               f"{fmt_bp(file_res)} bins, {clr.nnz:,} non-zero pixels")
+        if other:
+            print(f"compare {cpath}{'::' + clr_b.group if clr_b.group != '/' else ''}: "
+                  f"{fmt_bp(file_res_b)} bins, {clr_b.nnz:,} non-zero pixels; "
+                  f"{total_b:,.6g} {'weight' if args.balance else 'counts'} in view")
         print(f"view: {'genome-wide' if genome else ' + '.join(s.label for s in segments)} "
               f"({len(segments)} segment{'s' * (len(segments) > 1)}, {fmt_bp(span)}) "
               f"at {fmt_bp(binsize)} bins -> {m.shape[0]:,} x {m.shape[0]:,}")
@@ -655,7 +754,7 @@ def main(argv=None):
                 if len(segments) > 1 else ""
             print(f"colocation {'weight' if args.balance else 'counts'} in view: {total:,.6g}{share}")
         placed = svs_in_view(args, segments, binsize) if args.sv_vcf else None
-        plot(m, segments, binsize, file_res, args, total, within, out, genome, placed)
+        plot(m, segments, binsize, file_res, args, total, within, out, genome, placed, other)
         print(f"wrote {out}")
         return 0
     except (InputError, OSError) as exc:

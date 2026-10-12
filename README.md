@@ -62,6 +62,65 @@ annotates them on the figure.
 - [`samtools`](https://www.htslib.org/) on `PATH`
 - Python 3 with `numpy`, `matplotlib`, `scikit-learn`
 
+## `ont_colocation.py`
+
+Builds a **TruPath-style colocation map from long reads** (ONT, PacBio), so the two technologies can be
+compared directly. A TruPath constellation reconstructs one long DNA molecule; a long read *is* one
+molecule. Each read adds one count to every pair of bins it covers. That includes the bins of its split
+(supplementary) alignments listed in the `SA` tag, which is how amplicon, ecDNA and SV junctions reach
+the off-diagonal. Deletions and skips inside one alignment leave their bins uncovered once they are at
+least one bin long. The output is a cooler v3 file on the same bin grid as DRAGEN's (`--like`), so
+`plot_colocation.py`, `cooler zoomify` / `balance` and HiGlass all read it.
+
+`plot_colocation.py --compare` then draws both maps in one figure: TruPath above the diagonal, the long
+reads below, each on its own adaptive colour scale. The two count different things (read-pair
+colocations vs reads), so they don't share a scale. A junction seen by both technologies shows up as
+mirror-image spots across the diagonal.
+
+### Usage: MYCN amplicon example
+
+```bash
+# 1. long-read map on the TruPath grid; count reads touching the amplicon and its partner segments
+python3 ont_colocation.py --input ont.bam --like sample.colocation.cooler \
+  --region chr2:13,000,000-18,000,000 --region chr12:67,000,000-69,000,000 -o ont.colocation.cool
+
+# 2. split view of the MYCN region
+python3 plot_colocation.py sample.colocation.cooler --compare ont.colocation.cool \
+  --names TruPath,ONT --region chr2:15,500,000-16,300,000
+
+# 3. co-amplified segments side by side: the blocks between them are the amplicon junctions
+python3 plot_colocation.py sample.colocation.cooler --compare ont.colocation.cool --names TruPath,ONT \
+  --region chr2:14,100,000-14,500,000 --region chr2:15,600,000-16,200,000 --region chr12:67,900,000-68,250,000
+```
+
+With `--region`, only reads that have an alignment in those regions are counted, but all of each read's
+segments are counted wherever they map. Give every amplicon segment its own `--region` so that reads
+lying entirely inside a partner segment are counted too. Without `--region` every read is counted; use a
+coarser `--binsize` for a whole genome.
+
+Tips for highly amplified loci:
+
+- the colour scale adapts to the amplicon (often 50–100 copies), so the non-amplified background drops
+  below the white threshold; add `--dynamic-range 1000` to `plot_colocation.py` to show it as well;
+- both maps must come from the same reference build; `--compare` stops if a contig's length differs;
+- run `cooler balance` on both files and add `--balance` to compare linkage with copy number
+  normalised away.
+
+### Options
+
+| option | meaning |
+|--------|---------|
+| `--input`, `--reference` | indexed long-read BAM/CRAM (e.g. minimap2, with `SA` tags), and the FASTA for CRAM |
+| `--like` | TruPath cooler or `.mcool` whose bin size to copy; warns if contig lengths differ |
+| `--binsize` | bin size in bp (default 2000, or that of `--like`) |
+| `-r, --region` | count reads with an alignment here; repeatable (default: every read) |
+| `--mapq`, `--min-length` | minimum MAPQ per alignment segment (default 20); minimum read length |
+| `-o/--out`, `--assembly`, `--threads` | output cooler, assembly label, decompression threads |
+
+### Requirements
+
+- Python 3 with [`pysam`](https://pysam.readthedocs.io/), `numpy`, `h5py`
+
 ## `plot_virtual_fish.py`
 
 **Virtual FISH**: each read pair is coloured by the chromosome or region it maps to and drawn at the
@@ -209,6 +268,8 @@ python3 plot_colocation.py sample.colocation.cooler --region chrX:150,000,000-15
     --triangle --depth 2e6
 python3 plot_colocation.py sample.colocation.cooler --region chr9 --region chr22 -o chr9_chr22.png
 python3 plot_colocation.py sample.colocation.cooler --sv-vcf sample.sv.vcf.gz             # mark SV calls
+python3 plot_colocation.py sample.colocation.cooler --compare ont.colocation.cool \
+    --names TruPath,ONT --region chr2:15,500,000-16,300,000                            # see below
 python3 plot_colocation.py sample.colocation.cooler --info                  # bin size, contigs, nnz
 ```
 
@@ -234,6 +295,7 @@ python3 plot_colocation.py sample.colocation.mcool
 | `--sv-all` | also mark non-PASS calls (faded) |
 | `--sv-types` | SV types to mark (default `DEL,DUP,INV,BND`) |
 | `--sv-min-length` | hide intra-chromosomal calls shorter than this (bp; default two plot bins) |
+| `--compare`, `--names` | second map drawn below the diagonal on its own colour scale (see `ont_colocation.py`), and the two maps' names |
 | `--balance` | use `bins/weight` from `cooler balance` instead of raw counts |
 | `--vmax`, `--vmin`, `--dynamic-range` | colour scale limits (default: 99.9th percentile of off-diagonal values, and that ÷ 30); values below the minimum are white |
 | `--linear` | linear instead of log colour scale (minimum 0) |
